@@ -11,6 +11,18 @@ major/minor/patch mean for the CLI, the SDK, and the `.indx` artifact format.
 
 Nothing yet.
 
+## [0.0.2] — 2026-06-07
+
+Documentation release. No changes to the SDK, the CLI surface, or the `.indx` archive
+format (`schema_version` stays `"1"`); the wheel is functionally identical to `0.0.1`.
+
+### Docs
+
+- Rewrote the README into a clearer, more inspiring landing page: a centered hero, the
+  `indx demo` transcript, a "chunk that remembers everything" walkthrough, a bring-your-own-stack
+  slot table, the AI-agent connectors, and the four target personas. This is what renders as
+  the project description on PyPI.
+
 ## [0.0.1] — 2026-06-07
 
 First public release on PyPI: the light pure-Python core, the full
