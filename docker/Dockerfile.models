@@ -1,0 +1,11 @@
+# Bakes model weights (ollama qwen2.5, bge-m3) onto the defaults image so the air-gapped
+# and e2e tests need NO network for models. This is the expensive, rarely-rebuilt layer —
+# build on a schedule / dependency bump and push to a registry cache (testing-strategy §4.2).
+FROM indx-defaults:latest
+
+# Placeholder for weight baking, e.g.:
+#   RUN ollama pull qwen2.5 && python -c "from FlagEmbedding import BGEM3FlagModel; BGEM3FlagModel('BAAI/bge-m3')"
+# Kept inert in the scaffold (no network at build); the layering is what matters here.
+
+ENV INDX_OFFLINE=1
+ENTRYPOINT ["indx"]

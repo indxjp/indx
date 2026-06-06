@@ -1,0 +1,16 @@
+Acme Robotics — Team Directory
+
+This is a plain-text directory of who owns what. It is referenced from the
+engineering code-review notes when you need to find an area owner.
+
+Engineering
+  - Platform .......... owned by the platform group
+  - Robotics control .. owned by the controls group
+  - Developer tooling . owned by the tooling group
+
+People
+  - Onboarding, time off, remote work: the people team
+
+How to use this
+  Find the area your change touches, then request review from that area's owner.
+  When in doubt, ask in the team channel — see the handbook welcome page.

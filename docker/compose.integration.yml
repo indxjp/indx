@@ -1,0 +1,46 @@
+# T3 integration: run the @integration suite against real backend services.
+# Every external image is pinned by digest in a real setup (R-4: no surprise upgrades).
+# Healthchecks + depends_on:service_healthy remove the classic "service not up yet" flake.
+name: indx-integration
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/6333"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_PASSWORD: indx
+      POSTGRES_DB: indx
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  ollama:
+    image: ollama/ollama:0.5.4
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  tests:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.app
+    environment:
+      INDX_QDRANT_URL: http://qdrant:6333
+      INDX_PG_DSN: postgresql://postgres:indx@postgres:5432/indx
+      INDX_OLLAMA_URL: http://ollama:11434
+    depends_on:
+      qdrant: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      ollama: { condition: service_healthy }
+    command: ["python", "-m", "pytest", "-m", "integration", "tests/integration", "-q"]

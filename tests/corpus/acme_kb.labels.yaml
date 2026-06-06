@@ -1,0 +1,116 @@
+# Hand-authored expected structure for the acme_kb corpus — a realistic, deeply nested
+# company knowledge base (handbook / engineering / finance / policies). It is larger and
+# deeper than nested_handbook/split_report and mixes file types (.md, .txt, .rst) so the
+# offline journey e2e proves indx holds up on a complex, real-shaped tree.
+#
+# Every value here is the *actual* deterministic output of the offline core stack
+# (plaintext + hash + jsonl, seed=0); the journey test asserts indx reproduces it exactly.
+corpus: acme_kb
+exercises: [walk-lineage, sibling, parent, continues, references, retrieval, doc-type]
+
+documents: 24
+
+# Detected doc-type histogram (folder/name heuristics).
+types:
+  markdown: 15
+  text: 3
+  onboarding: 3
+  policy: 3
+
+# Folder lineage each document must carry (path -> lineage parts).
+lineage:
+  README.md: []
+  company-overview.md: []
+  handbook/index.md: [handbook]
+  handbook/onboarding/index.md: [handbook, onboarding]
+  handbook/onboarding/day-1-checklist.md: [handbook, onboarding]
+  handbook/onboarding/accounts-and-access.md: [handbook, onboarding]
+  handbook/benefits/index.md: [handbook, benefits]
+  handbook/benefits/health-insurance.md: [handbook, benefits]
+  handbook/benefits/retirement-401k.md: [handbook, benefits]
+  handbook/benefits/paid-time-off.md: [handbook, benefits]
+  engineering/index.md: [engineering]
+  engineering/architecture/index.md: [engineering, architecture]
+  engineering/architecture/search-pipeline.md: [engineering, architecture]
+  engineering/architecture/vector-store.md: [engineering, architecture]
+  engineering/runbooks/incident-response.md: [engineering, runbooks]
+  engineering/runbooks/deploy-checklist.md: [engineering, runbooks]
+  engineering/guides/code-review.md: [engineering, guides]
+  engineering/guides/testing-strategy.md: [engineering, guides]
+  finance/quarterly-report-part-1.txt: [finance]
+  finance/quarterly-report-part-2.txt: [finance]
+  finance/quarterly-report-part-3.txt: [finance]
+  policies/index.md: [policies]
+  policies/security-policy.rst: [policies]
+  policies/data-retention.md: [policies]
+
+# Unordered sibling pairs (same folder). The set must match exactly (deterministic).
+sibling_pairs:
+  - [README.md, company-overview.md]
+  - [engineering/architecture/index.md, engineering/architecture/search-pipeline.md]
+  - [engineering/architecture/index.md, engineering/architecture/vector-store.md]
+  - [engineering/architecture/search-pipeline.md, engineering/architecture/vector-store.md]
+  - [engineering/guides/code-review.md, engineering/guides/testing-strategy.md]
+  - [engineering/runbooks/deploy-checklist.md, engineering/runbooks/incident-response.md]
+  - [finance/quarterly-report-part-1.txt, finance/quarterly-report-part-2.txt]
+  - [finance/quarterly-report-part-1.txt, finance/quarterly-report-part-3.txt]
+  - [finance/quarterly-report-part-2.txt, finance/quarterly-report-part-3.txt]
+  - [handbook/benefits/health-insurance.md, handbook/benefits/index.md]
+  - [handbook/benefits/health-insurance.md, handbook/benefits/paid-time-off.md]
+  - [handbook/benefits/health-insurance.md, handbook/benefits/retirement-401k.md]
+  - [handbook/benefits/index.md, handbook/benefits/paid-time-off.md]
+  - [handbook/benefits/index.md, handbook/benefits/retirement-401k.md]
+  - [handbook/benefits/paid-time-off.md, handbook/benefits/retirement-401k.md]
+  - [handbook/onboarding/accounts-and-access.md, handbook/onboarding/day-1-checklist.md]
+  - [handbook/onboarding/accounts-and-access.md, handbook/onboarding/index.md]
+  - [handbook/onboarding/day-1-checklist.md, handbook/onboarding/index.md]
+  - [policies/data-retention.md, policies/index.md]
+  - [policies/data-retention.md, policies/security-policy.rst]
+  - [policies/index.md, policies/security-policy.rst]
+
+# Directed parent edges (folder index/readme -> folder-mate). Must match exactly.
+parent_edges:
+  - [README.md, company-overview.md]
+  - [engineering/architecture/index.md, engineering/architecture/search-pipeline.md]
+  - [engineering/architecture/index.md, engineering/architecture/vector-store.md]
+  - [handbook/benefits/index.md, handbook/benefits/health-insurance.md]
+  - [handbook/benefits/index.md, handbook/benefits/paid-time-off.md]
+  - [handbook/benefits/index.md, handbook/benefits/retirement-401k.md]
+  - [handbook/onboarding/index.md, handbook/onboarding/accounts-and-access.md]
+  - [handbook/onboarding/index.md, handbook/onboarding/day-1-checklist.md]
+  - [policies/index.md, policies/data-retention.md]
+  - [policies/index.md, policies/security-policy.rst]
+
+# Ordered `continues` chain across the numbered finance report (directed, by path).
+continues_chain:
+  - [finance/quarterly-report-part-1.txt, finance/quarterly-report-part-2.txt]
+  - [finance/quarterly-report-part-2.txt, finance/quarterly-report-part-3.txt]
+
+# Lexical-retrieval expectations: each query's top hit must be this path (offline hash
+# embedder is deterministic, so the rank-1 document is stable). doc_type lets the
+# connector's typed-search path be exercised too.
+retrieval:
+  - query: "first day laptop setup checklist"
+    top: handbook/onboarding/day-1-checklist.md
+  - query: "retirement 401k matching contribution dollar"
+    top: handbook/benefits/retirement-401k.md
+  - query: "health insurance dental vision premium"
+    top: handbook/benefits/health-insurance.md
+  - query: "search pipeline reranking ranks relevance"
+    top: engineering/architecture/search-pipeline.md
+  - query: "vector store nearest neighbor embeddings index"
+    top: engineering/architecture/vector-store.md
+  - query: "incident on-call severity escalation"
+    top: engineering/runbooks/incident-response.md
+  - query: "quarterly revenue grew across every region"
+    top: finance/quarterly-report-part-1.txt
+  - query: "two-factor authentication hardware key secrets vault"
+    top: policies/security-policy.rst
+
+# Relation-quality floors (sibling/parent/continues are structural — precision 1.0 by
+# construction; references is content-based, so only its presence is required).
+floors:
+  sibling: { precision: 1.0, recall: 1.0 }
+  parent: { precision: 1.0, recall: 1.0 }
+  continues: { precision: 1.0, recall: 1.0 }
+  references_min: 1

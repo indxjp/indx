@@ -1,0 +1,31 @@
+# Hand-authored expected structure for the nested_handbook corpus.
+# The corpus test asserts indx recovers exactly this (testing-strategy §3.2).
+corpus: nested_handbook
+exercises: [walk-lineage, sibling, parent]
+
+# Folder lineage each document must carry (path -> lineage parts).
+lineage:
+  README.md: []
+  onboarding/index.md: [onboarding]
+  onboarding/welcome.md: [onboarding]
+  onboarding/day-two.md: [onboarding]
+  policies/leave.md: [policies]
+  policies/security.md: [policies]
+  eng/setup.md: [eng]
+
+# Unordered sibling pairs that must exist (same folder). Pairs are by path.
+sibling_pairs:
+  - [onboarding/index.md, onboarding/welcome.md]
+  - [onboarding/index.md, onboarding/day-two.md]
+  - [onboarding/welcome.md, onboarding/day-two.md]
+  - [policies/leave.md, policies/security.md]
+
+# Directed parent edges (folder index/readme -> folder-mate), by path.
+parent_edges:
+  - [onboarding/index.md, onboarding/welcome.md]
+  - [onboarding/index.md, onboarding/day-two.md]
+
+# Relation-quality floors for this corpus (precision must hold; recall tracked).
+floors:
+  sibling: { precision: 1.0, recall: 1.0 }
+  parent: { precision: 1.0, recall: 1.0 }

@@ -1,0 +1,44 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    name: build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build
+      # Release gates on the packaged artifact, not the source tree (testing-strategy §5):
+      # the same clean-install + smoke run that ships to PyPI must pass against the wheel.
+      - name: Smoke-test the built wheel (zero-dependency core path)
+        run: |
+          python -m venv /tmp/relenv
+          /tmp/relenv/bin/pip install dist/*.whl
+          /tmp/relenv/bin/indx --version
+          /tmp/relenv/bin/indx tests/corpus/airgap_smoke --out /tmp/relout \
+            --parser plaintext --embedder hash --store jsonl --format jsonl --llm none
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  publish:
+    name: publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # PyPI trusted publishing (OIDC), no API token in secrets
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

@@ -1,0 +1,197 @@
+"""DoclingParser — the default parser. Requires the ``docling`` extra.
+
+Docling is a local, high-fidelity layout/table/figure parser. This adapter converts one
+source file into indx's normalized :class:`~indx.core.parsed.ParsedDoc` and never lets a
+Docling vendor type escape the :meth:`DoclingParser.parse` boundary (coding-standards §6.2).
+
+The heavy ``docling`` dependency is imported lazily inside :meth:`__init__`/:meth:`parse`,
+so merely importing this module is always safe on a light core install (coding-standards §6.3).
+Selecting this parser without the extra installed raises
+:class:`~indx.errors.MissingExtraError` at construction time.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from indx.core.parsed import Block, ParsedDoc
+from indx.errors import StageError
+from indx.utils.lazy import require_extra
+
+if TYPE_CHECKING:
+    from docling.document_converter import (  # type: ignore[import-not-found]  # optional extra: docling
+        DocumentConverter,
+    )
+
+logger = logging.getLogger(__name__)
+
+# Map Docling item ``label`` values onto the small ParsedDoc kind vocabulary
+# (text | heading | table | caption | code | ...). Anything unmapped falls back to "text".
+_LABEL_TO_KIND: dict[str, str] = {
+    "title": "heading",
+    "section_header": "heading",
+    "page_header": "heading",
+    "subtitle": "heading",
+    "caption": "caption",
+    "code": "code",
+    "formula": "code",
+    "table": "table",
+    "footnote": "text",
+    "paragraph": "text",
+    "text": "text",
+    "list_item": "text",
+}
+
+
+class DoclingParser:
+    """Default parser backend built on Docling's :class:`DocumentConverter`.
+
+    Converts a local file into a :class:`~indx.core.parsed.ParsedDoc` by walking the native
+    ``DoclingDocument`` in reading order and flattening each item into a
+    :class:`~indx.core.parsed.Block`. Vendor types are confined to this module.
+
+    Attributes:
+        name: Registry key for this backend (``"docling"``).
+        version: Adapter version, recorded on every emitted ``ParsedDoc``.
+    """
+
+    name = "docling"
+    version = "1"
+
+    def __init__(self) -> None:
+        """Construct the parser, failing fast if the ``docling`` extra is absent.
+
+        Raises:
+            MissingExtraError: If ``indx[docling]`` is not installed.
+        """
+        # Import-safety (§6.3): the gate lives here, not at module top level, so importing
+        # this module never crashes a light core install.
+        require_extra("parser", "docling", "docling", "docling")
+        self._converter: DocumentConverter | None = None
+
+    def parse(self, path: Path) -> ParsedDoc:
+        """Parse one local file into a normalized :class:`ParsedDoc`.
+
+        Args:
+            path: Local filesystem path to the source document. Docling parses local
+                paths only; this adapter never touches the network (constraint 1).
+
+        Returns:
+            A :class:`ParsedDoc` whose blocks are the document's items in reading order.
+
+        Raises:
+            StageError: If Docling fails to convert the file.
+        """
+        converter = self._get_converter()
+        try:
+            result = converter.convert(str(path))
+        except Exception as exc:  # vendor exception — translate at the edge (§8)
+            raise StageError("parse", f"docling failed: {exc}", path=str(path)) from exc
+
+        # ``document`` is a DoclingDocument — a VENDOR type that must die inside this method.
+        document = result.document
+        blocks = self._to_blocks(document)
+        return ParsedDoc(
+            source_path=str(path),
+            parser=self.name,
+            parser_version=self.version,
+            blocks=blocks,
+        )
+
+    def _get_converter(self) -> DocumentConverter:
+        """Return a cached :class:`DocumentConverter`, building it once per instance.
+
+        Returns:
+            The lazily-constructed Docling converter.
+        """
+        if self._converter is None:
+            # Lazy: imported only when we actually parse, never at module top level.
+            # (Resolved for typing via the TYPE_CHECKING import above; optional extra: docling.)
+            from docling.document_converter import DocumentConverter
+
+            self._converter = DocumentConverter()
+        return self._converter
+
+    def _to_blocks(self, document: object) -> list[Block]:
+        """Flatten a ``DoclingDocument`` into ordered :class:`Block` objects.
+
+        Iterates the document's items in Docling's deterministic reading order so
+        ``Block.order`` is stable run-to-run (constraint 4). Empty items are skipped.
+
+        Args:
+            document: The native ``DoclingDocument`` (vendor type, never leaks out).
+
+        Returns:
+            Blocks in document reading order, each with a stable ``order`` index.
+        """
+        blocks: list[Block] = []
+        order = 0
+        for item in _iter_items(document):
+            text = _text_of(item)
+            if not text:
+                continue
+            blocks.append(Block(kind=_kind_of(item), text=text, order=order))
+            order += 1
+        return blocks
+
+
+def _iter_items(document: object) -> list[object]:
+    """Yield a document's content items in a deterministic reading order.
+
+    Prefers Docling's ``iterate_items()`` (reading-order traversal); falls back to the
+    flat ``texts`` collection if that method is unavailable.
+
+    Args:
+        document: A ``DoclingDocument``.
+
+    Returns:
+        The native items in a fixed order.
+    """
+    iterate = getattr(document, "iterate_items", None)
+    if callable(iterate):
+        items: list[object] = []
+        for entry in iterate():
+            # ``iterate_items`` yields ``(item, level)`` tuples; older shapes yield items.
+            if isinstance(entry, tuple) and entry:
+                items.append(entry[0])
+            else:
+                items.append(entry)
+        return items
+    return list(getattr(document, "texts", []))
+
+
+def _kind_of(item: object) -> str:
+    """Map a native item's ``label`` to a ParsedDoc block kind.
+
+    Args:
+        item: A Docling item exposing an optional ``label``.
+
+    Returns:
+        One of the ParsedDoc kind strings; defaults to ``"text"``.
+    """
+    label = getattr(item, "label", None)
+    label_str = str(getattr(label, "value", label) or "").lower()
+    return _LABEL_TO_KIND.get(label_str, "text")
+
+
+def _text_of(item: object) -> str:
+    """Extract the text payload of a native item.
+
+    Handles plain text items (``.text``) and tables (``export_to_markdown()``).
+
+    Args:
+        item: A Docling item.
+
+    Returns:
+        The item's stripped text, or an empty string if it carries none.
+    """
+    export_md = getattr(item, "export_to_markdown", None)
+    if callable(export_md) and getattr(item, "text", None) is None:
+        try:
+            return str(export_md()).strip()
+        except Exception:  # noqa: BLE001 - tables without a doc context can't render
+            return ""
+    text = getattr(item, "text", None)
+    return str(text).strip() if text is not None else ""

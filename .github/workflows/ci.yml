@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Static + offline test suite on the CORE install (no extras). fastapi is absent here, so the
+  # `indx app` API tests self-skip and the "construction without extra" guards stay meaningful.
+  lint-test:
+    name: lint · test (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false  # text corpus runs without LFS objects (testing-strategy §3.3)
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dev]"
+      - run: ruff check src tests
+      - run: ruff format --check src tests
+      - name: Fast offline suite (unit + corpus)
+        run: pytest -q --cov=indx
+
+  # Comprehensive static typing + the `indx app` API suite. The `app` extra (fastapi/uvicorn)
+  # plus httpx (Starlette's TestClient) are installed so mypy resolves the lazily-imported
+  # fastapi types across the WHOLE tree and the API endpoints are exercised for real instead of
+  # self-skipping. mypy is python-version-pinned in config, so one canonical run suffices.
+  types-and-app:
+    name: types · app api (py3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[app,dev]" httpx
+      - name: Static types (full tree, fastapi resolved)
+        run: mypy src/indx
+      - name: indx app API + CLI suite
+        run: pytest -q tests/unit/app
+
+  # Static checks + production build for the Next.js web tester (webapp/). Node is a
+  # build-time-only dependency: this proves the bundle the package ships actually compiles and
+  # static-exports to an index.html, and that it passes its own lint + type gates.
+  frontend:
+    name: webapp · lint · types · build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webapp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: webapp/package-lock.json
+      - run: npm ci
+      - name: Lint (next lint / eslint)
+        run: npm run lint
+      - name: Static types (tsc --noEmit)
+        run: npx tsc --noEmit
+      - name: Production static export builds
+        run: npm run build
+      - name: Static bundle produced index.html
+        run: test -f out/index.html

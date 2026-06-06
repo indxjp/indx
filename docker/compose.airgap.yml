@@ -1,0 +1,14 @@
+# Air-gap proof (testing-strategy §4.4c): run the default-stack build with NO network path
+# out of the container. `network_mode: none` is a kernel guarantee — if any code tries to
+# reach the network, it cannot, and the in-process socket guard turns that into a failure.
+name: indx-airgap
+
+services:
+  airgap:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.app
+      args:
+        BASE: indx-models:latest   # weights baked in; no pull needed
+    network_mode: "none"
+    command: ["python", "-m", "pytest", "-m", "corpus", "tests/airgap", "-q"]

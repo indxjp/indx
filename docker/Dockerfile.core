@@ -1,0 +1,16 @@
+# The light-core image: the wheel installed with NO extras.
+# Subject of the clean-install, light-core-closure, and missing-extra tests
+# (testing-strategy §4.4 a/b). Proves the zero-dep fallback path runs offline.
+ARG PYTHON_VERSION=3.12
+FROM python:${PYTHON_VERSION}-slim
+
+WORKDIR /app
+# Install ONLY the built wheel — no -e, no extras, no dev deps.
+COPY dist/*.whl /tmp/
+RUN pip install --no-cache-dir /tmp/*.whl
+
+# A tiny corpus to exercise the offline default path inside the image.
+COPY tests/corpus/airgap_smoke /data/airgap_smoke
+
+ENTRYPOINT ["indx"]
+CMD ["--help"]

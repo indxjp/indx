@@ -1,0 +1,279 @@
+name: e2e
+
+# Comprehensive end-to-end tests against the REAL third-party services indx integrates
+# with (OpenAI, Anthropic, Cohere, LlamaParse, and the AWS / Azure / GCP cloud stacks).
+# These hit paid/live APIs, so they are opt-in: they run only on a release tag (v*) or on
+# demand (workflow_dispatch) — never on PR/push, and there is no nightly cron. Each service
+# runs only when its credential(s) are present in
+# repository Secrets; a service whose secret is absent is skipped (with a notice), and even
+# within a service every individual adapter test self-skips unless the resource it needs is
+# configured — so a fork or a partially-provisioned account still gets a green run for the
+# pieces it has.
+#
+# To enable a service, add its secret(s) under Settings → Secrets and variables → Actions:
+#   OPENAI_API_KEY                                            → openai (embedder + LLM + VLM),
+#                                                               and the live AGENT tool-loop e2e
+#   ANTHROPIC_API_KEY                                         → anthropic (LLM)
+#   COHERE_API_KEY                                            → cohere (embedder)
+#   LLAMA_CLOUD_API_KEY                                       → llamaparse (parser)
+#
+#   --- AWS stack (indx[aws]) — boto3 credential chain + region ---
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION    → bedrock LLM/VLM/embedder, textract
+#       (Bedrock needs model access enabled for the default Claude/Titan ids in that region)
+#   AWS_S3_VECTORS_BUCKET                                     → s3vectors store (boto3 >= 1.40)
+#
+#   --- Azure stack (indx[azure]) ---
+#   AZURE_OPENAI_API_KEY / _ENDPOINT                          → shared Azure OpenAI resource
+#   AZURE_OPENAI_DEPLOYMENT                                   → azure LLM (chat deployment)
+#   AZURE_OPENAI_VLM_DEPLOYMENT                               → azure VLM (vision deployment)
+#   AZURE_OPENAI_EMBED_DEPLOYMENT                             → azure embedder (embed deployment)
+#   AZURE_OPENAI_API_VERSION (optional)                       → azure api version override
+#   AZURE_DOCUMENTINTELLIGENCE_ENDPOINT / _KEY               → docintel parser
+#   AZURE_SEARCH_SERVICE_ENDPOINT / _API_KEY / _INDEX_NAME    → azure-search store
+#
+#   --- GCP stack (indx[gcp]) — ADC via a service-account key ---
+#   GCP_SERVICE_ACCOUNT_KEY                                   → SA JSON; written to a file and
+#       exported as GOOGLE_APPLICATION_CREDENTIALS for vertex LLM/VLM/embedder, docai, bigquery
+#   GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_LOCATION              → project + region
+#   DOCAI_PROCESSOR_ID / DOCAI_LOCATION (us/eu)               → docai parser
+#   BIGQUERY_DATASET                                          → bigquery store (existing dataset)
+#
+# NOT live-tested in the release gate: the opt-in OpenSearch (indx[aws-opensearch]) and Vertex
+# Vector Search (indx[gcp-vectorsearch]) stores. Both need always-on, always-billed resources
+# (OpenSearch Serverless OCU minimums; a deployed Vertex index endpoint on always-on compute) —
+# unlike the scale-to-zero s3vectors/bigquery defaults — so they stay covered by unit tests
+# (tests/unit/store/) instead. The adapters are unchanged and remain installable for opt-in users.
+#
+# AI-AGENT CONNECTORS (indx.agent — "plug a knowledge space into any agent"):
+#   * The `extras` job exercises each framework bridge against its REAL SDK with NO API key —
+#     the MCP server (a genuine `indx mcp` stdio JSON-RPC round-trip via the official client),
+#     plus the LangChain / Pydantic-AI / OpenAI-Agents / Claude-Agent adapters.
+#   * The `live` job's `agent` leg drives a REAL OpenAI model through the connector's raw
+#     tool-call loop, proving the model calls indx_search and grounds its answer.
+#   The offline build→inspect→query→connect journey over the complex `acme_kb` fixture runs in
+#   the DEFAULT (corpus-tier) CI suite, so it gates every PR — not just this release workflow.
+
+on:
+  # Release gate: a version tag (e.g. v1.2.3) validates the build against the REAL cloud
+  # services before it ships. Tags are deliberate, infrequent events, so the paid/live cost
+  # is bounded — and a leg whose Secrets are absent still self-skips to green. No nightly
+  # cron: this paid/live suite runs only on a release tag or on demand (workflow_dispatch).
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      services:
+        description: "pytest -k filter to run a subset (blank = all available)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Proves the published console script installs and runs end-to-end with ZERO secrets,
+  # so "can I install indx in CI?" never depends on any API key being configured.
+  install-smoke:
+    name: install · offline e2e (no keys)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - name: Console script is wired up
+        run: indx --version
+      - name: Offline build → inspect → query journey
+        run: indx demo
+
+  live:
+    name: live e2e · ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    # One service per matrix leg: isolates installs (only that service's extra) and makes
+    # the per-service skip/run state obvious in the Actions UI.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: openai
+            extra: openai
+            tests: tests/live/test_openai.py
+            primary: OPENAI_API_KEY
+          - service: anthropic
+            extra: anthropic
+            tests: tests/live/test_anthropic.py
+            primary: ANTHROPIC_API_KEY
+          - service: cohere
+            extra: cohere
+            tests: tests/live/test_cohere.py
+            primary: COHERE_API_KEY
+          - service: llamaparse
+            extra: llamaparse
+            tests: tests/live/test_llamaparse.py
+            primary: LLAMA_CLOUD_API_KEY
+          - service: azure
+            extra: azure
+            tests: tests/live/test_azure.py
+            primary: AZURE_OPENAI_API_KEY
+          - service: aws
+            extra: aws
+            tests: tests/live/test_aws.py
+            primary: AWS_ACCESS_KEY_ID
+          - service: gcp
+            extra: gcp
+            tests: tests/live/test_gcp.py
+            primary: GCP_SERVICE_ACCOUNT_KEY
+          # The "plug a knowledge space into any agent" claim, proven with a REAL LLM: a raw
+          # OpenAI tool-call loop drives indx_search via the connector's openai_schema()/call()
+          # and grounds its answer in the retrieved chunk. Needs only the openai extra + key —
+          # the agent-framework SDK bridges are covered key-free in the `extras` job below.
+          - service: agent
+            extra: openai
+            tests: tests/live/test_agent.py
+            primary: OPENAI_API_KEY
+    env:
+      # Every service credential is exposed to every leg; each leg's guard + the tests'
+      # own require_env skip mean only the matching key is actually consumed. Absent
+      # secrets resolve to "" → the guard skips the leg.
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+      LLAMA_CLOUD_API_KEY: ${{ secrets.LLAMA_CLOUD_API_KEY }}
+      # Azure (indx[azure]): shared Azure OpenAI resource + per-modality deployments,
+      # Document Intelligence, and AI Search.
+      AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+      AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+      AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+      AZURE_OPENAI_VLM_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_VLM_DEPLOYMENT }}
+      AZURE_OPENAI_EMBED_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_EMBED_DEPLOYMENT }}
+      AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
+      AZURE_DOCUMENTINTELLIGENCE_ENDPOINT: ${{ secrets.AZURE_DOCUMENTINTELLIGENCE_ENDPOINT }}
+      AZURE_DOCUMENTINTELLIGENCE_KEY: ${{ secrets.AZURE_DOCUMENTINTELLIGENCE_KEY }}
+      AZURE_SEARCH_SERVICE_ENDPOINT: ${{ secrets.AZURE_SEARCH_SERVICE_ENDPOINT }}
+      AZURE_SEARCH_API_KEY: ${{ secrets.AZURE_SEARCH_API_KEY }}
+      AZURE_SEARCH_INDEX_NAME: ${{ secrets.AZURE_SEARCH_INDEX_NAME }}
+      # AWS (indx[aws]): boto3 credential chain + region + resources.
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_S3_VECTORS_BUCKET: ${{ secrets.AWS_S3_VECTORS_BUCKET }}
+      # GCP (indx[gcp]): ADC is materialized from the SA-key secret
+      # in a dedicated step (GOOGLE_APPLICATION_CREDENTIALS is exported there).
+      GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+      GOOGLE_CLOUD_PROJECT: ${{ secrets.GOOGLE_CLOUD_PROJECT }}
+      GOOGLE_CLOUD_LOCATION: ${{ secrets.GOOGLE_CLOUD_LOCATION }}
+      DOCAI_PROCESSOR_ID: ${{ secrets.DOCAI_PROCESSOR_ID }}
+      DOCAI_LOCATION: ${{ secrets.DOCAI_LOCATION }}
+      BIGQUERY_DATASET: ${{ secrets.BIGQUERY_DATASET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check for ${{ matrix.service }} credentials
+        id: guard
+        env:
+          PRIMARY: ${{ matrix.primary }}
+        run: |
+          # Indirect expansion: read the env var whose NAME is in $PRIMARY.
+          if [ -z "${!PRIMARY}" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=${{ matrix.service }} skipped::$PRIMARY is not set in Secrets — skipping live e2e for ${{ matrix.service }}."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=${{ matrix.service }} enabled::$PRIMARY present — running live e2e for ${{ matrix.service }}."
+          fi
+
+      # GCP auth needs a credentials *file*: write the SA-key secret to disk and point ADC
+      # (GOOGLE_APPLICATION_CREDENTIALS) at it for the steps that follow. Only the gcp leg.
+      - name: Materialize GCP credentials
+        if: matrix.service == 'gcp' && steps.guard.outputs.present == 'true'
+        run: |
+          key_file="$RUNNER_TEMP/gcp-sa.json"
+          printf '%s' "$GCP_SERVICE_ACCOUNT_KEY" > "$key_file"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$key_file" >> "$GITHUB_ENV"
+          echo "::notice title=gcp auth::wrote service-account key and set GOOGLE_APPLICATION_CREDENTIALS."
+
+      - name: Install indx[${{ matrix.extra }}]
+        if: steps.guard.outputs.present == 'true'
+        run: pip install -e ".[${{ matrix.extra }},dev]"
+
+      - name: Live e2e · ${{ matrix.service }}
+        if: steps.guard.outputs.present == 'true'
+        run: |
+          pytest -m live ${{ matrix.tests }} -v \
+            ${{ github.event.inputs.services && format('-k {0}', github.event.inputs.services) || '' }}
+
+  # Optional-backend libraries that need NO API key (local parsers/embedders/stores/writers).
+  # Each leg installs exactly one extra and runs its real library end to end. Some download
+  # public models from Hugging Face on first run, hence the long timeout + pip cache.
+  extras:
+    name: extras e2e · ${{ matrix.backend }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: markitdown
+            extra: markitdown
+            tests: tests/extras/test_parsers.py::test_markitdown_build
+          - backend: docling
+            extra: docling
+            tests: tests/extras/test_parsers.py::test_docling_build
+          - backend: unstructured
+            extra: unstructured
+            tests: tests/extras/test_parsers.py::test_unstructured_build
+          - backend: e5
+            extra: e5
+            tests: tests/extras/test_embedders.py::test_e5_direct_and_build
+          - backend: bge
+            extra: bge
+            tests: tests/extras/test_embedders.py::test_bge_direct_and_build
+          - backend: chroma
+            extra: chroma
+            tests: tests/extras/test_stores.py::test_chroma_round_trip
+          - backend: lancedb
+            extra: lancedb
+            tests: tests/extras/test_stores.py::test_lancedb_round_trip
+          - backend: langchain
+            extra: langchain
+            tests: tests/extras/test_writers.py::test_langchain_writer
+          - backend: llamaindex
+            extra: llamaindex
+            tests: tests/extras/test_writers.py::test_llamaindex_writer
+          # --- AI-agent connectors (indx.agent) — each bridge runs against its REAL SDK, no
+          # API key. One extra per leg; the connector tests self-skip (requires_lib) for every
+          # framework whose library that leg did not install, so each leg runs exactly its bridge.
+          - backend: mcp
+            extra: mcp
+            tests: tests/extras/test_mcp_server.py
+          - backend: langchain-agent
+            extra: langchain
+            tests: tests/extras/test_agent_connectors.py
+          - backend: pydantic-ai
+            extra: pydantic-ai
+            tests: tests/extras/test_agent_connectors.py
+          - backend: openai-agents
+            extra: openai-agents
+            tests: tests/extras/test_agent_connectors.py
+          - backend: claude-agent
+            extra: claude-agent
+            tests: tests/extras/test_agent_connectors.py
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install indx[${{ matrix.extra }}]
+        run: pip install -e ".[${{ matrix.extra }},dev]"
+      - name: Extras e2e · ${{ matrix.backend }}
+        run: pytest -m extras "${{ matrix.tests }}" -v

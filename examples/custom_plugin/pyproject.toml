@@ -1,0 +1,33 @@
+# Teaching example: how a third-party package advertises an indx backend.
+#
+# This file is NOT meant to be installed as-is; it shows the one declaration that turns a
+# plain class into a discoverable indx plugin. In a real distribution you would `pip install`
+# this package, and the registry would then find `uppercase` under the `indx.parsers` group.
+#
+# The entry-point GROUP must match the slot's real group name from src/indx/registry:
+#   parser  -> indx.parsers
+#   llm     -> indx.llms
+#   vlm     -> indx.vlms
+#   embedder-> indx.embedders
+#   store   -> indx.stores
+#   writer  -> indx.outputs   (legacy alias: indx.writers)
+#   stage   -> indx.stages
+#
+# Built-ins always win name collisions, so a plugin may not silently shadow a built-in name.
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "indx-uppercase-parser"
+version = "0.1.0"
+description = "A teaching-example third-party indx parser plugin."
+requires-python = ">=3.11"
+dependencies = ["indx"]
+
+# This is the load-bearing part: register the class under the parser group, keyed by the
+# slot name users select (e.g. `parser="uppercase"` or `--parser uppercase`). The value is
+# the usual `module:attr` target.
+[project.entry-points."indx.parsers"]
+uppercase = "indx_uppercase_parser:UppercaseParser"

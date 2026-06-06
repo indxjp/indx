@@ -1,0 +1,23 @@
+name: docker
+
+# T4 distribution tests on the packaged wheel. Light jobs on PR; heavier on schedule.
+on:
+  pull_request:
+  schedule:
+    - cron: "0 4 * * *"  # nightly: includes portability + determinism
+  workflow_dispatch:
+
+jobs:
+  distribution:
+    name: clean-install · missing-extra · air-gap · plugin · e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]" build
+      - name: Build wheel
+        run: python -m build --wheel --outdir dist
+      - name: Docker distribution suite
+        run: pytest -m docker tests/docker -q

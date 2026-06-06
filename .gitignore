@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.nox/
+.coverage
+htmlcov/
+
+# indx
+*.indx
+/scratch/
+tests/corpus/_heavy/*
+!tests/corpus/_heavy/.gitkeep
+
+# indx app — the Next.js bundle is build-time only (scripts/build_webapp.sh regenerates it).
+# Only the tracked .gitkeep is committed; `next build` clobbers index.html with a real bundle
+# that references the (ignored) _next/ assets, so we never track it. The server serves an
+# inline "not built yet" fallback (server.py) when the bundle is absent.
+src/indx/app/static/*
+!src/indx/app/static/.gitkeep
+
+# webapp (Next.js frontend) build artifacts & deps
+webapp/node_modules/
+webapp/.next/
+webapp/out/
+webapp/.turbo/
+*.tsbuildinfo

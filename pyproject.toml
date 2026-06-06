@@ -1,0 +1,258 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "indx"
+dynamic = ["version"]
+description = "Make directories AI-ready, not just files — turn a directory into a portable knowledge space."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "indx contributors" }]
+keywords = ["rag", "knowledge-graph", "document-ai", "embeddings", "retrieval"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+# Light core: only pure-Python, no native code, no cloud SDKs, no heavy parsers.
+dependencies = [
+  "pydantic>=2.6",
+  "pydantic-settings>=2.0",
+  "typer>=0.12",
+  "click>=8.1",
+  "rich>=13.0",
+  "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.urls]
+Homepage = "https://github.com/indxjp/indx"
+Documentation = "https://docs.indx.jp"
+Repository = "https://github.com/indxjp/indx"
+Issues = "https://github.com/indxjp/indx/issues"
+Changelog = "https://github.com/indxjp/indx/blob/main/CHANGELOG.md"
+
+[project.scripts]
+indx = "indx.cli.app:app"
+
+# --- Optional extras matrix (file-architecture §5). Heavy/cloud deps live here, never in core. ---
+[project.optional-dependencies]
+docling      = ["docling"]
+unstructured = ["unstructured"]
+llamaparse   = ["llama-cloud-services"]
+markitdown   = ["markitdown"]
+ollama       = ["ollama"]
+vllm         = ["vllm", "openai"]
+openai       = ["openai"]
+anthropic    = ["anthropic"]
+# LiteLLM: one SDK that fronts 100+ providers (on-prem Ollama/vLLM + AWS/Azure/GCP/cloud).
+# Powers the `litellm` LLM and embedder backends; pick the provider with a `provider/model`
+# string, e.g. --llm litellm:bedrock/anthropic.claude-3 or --embedder litellm:azure/<deployment>.
+litellm      = ["litellm>=1.40"]
+# ── Cloud profile extras: one install per cloud satisfies every pipeline slot. ──
+# AWS: a single SDK (boto3) covers parser+llm+vlm+embedder+default store. boto3>=1.40 is
+# required for the s3vectors client (S3 Vectors GA). opensearch-py is the only thing the
+# opt-in OpenSearch store adds, so it is a sub-extra.
+aws            = ["boto3>=1.40"]
+aws-opensearch = ["indx[aws]", "opensearch-py>=2.4"]
+# Azure: extended from the original ["openai"] LLM-only extra into the full stack. Additive —
+# `openai` stays; Document Intelligence + AI Search + identity/core round out the slots.
+azure        = ["openai>=1.40",
+                "azure-ai-documentintelligence>=1.0.0",
+                "azure-search-documents>=11.5.0",
+                "azure-identity>=1.16",
+                "azure-core>=1.30"]
+# GCP: unified google-genai for all three model slots, plus Document AI + BigQuery. The heavy
+# google-cloud-aiplatform is pulled only by the opt-in Vertex Vector Search sub-extra.
+gcp            = ["google-genai>=1.0",
+                  "google-cloud-documentai>=2.20",
+                  "google-cloud-bigquery>=3.20"]
+gcp-vectorsearch = ["indx[gcp]", "google-cloud-aiplatform>=1.50"]
+"qwen-vl"    = ["transformers", "torch", "qwen-vl-utils"]
+"vlm-local"  = ["httpx"]
+bge          = ["FlagEmbedding", "torch"]
+e5           = ["sentence-transformers", "torch"]
+cohere       = ["cohere"]
+qdrant       = ["qdrant-client"]
+pgvector     = ["psycopg[binary]", "pgvector"]
+chroma       = ["chromadb"]
+lancedb      = ["lancedb"]
+langchain    = ["langchain-core"]
+llamaindex   = ["llama-index-core"]
+# ── AI-agent connectors (docs/agent-integrations-design.md). The portable .indx archive is a
+# "USB drive" of knowledge; these extras are the plug for each agent framework. Each adapter
+# imports its SDK lazily and gates on its own extra, so core stays light. `indx[mcp]` (the
+# Model Context Protocol server) is the universal connector — it reaches MCP clients in any
+# language, including the TypeScript Mastra framework. The `langchain` extra above doubles as
+# the LangChain connector's gate (langchain-core).
+# FastMCP (v2) is the batteries-included MCP server framework; it depends on the official
+# `mcp` SDK, so the in-package fallback (`mcp.server.fastmcp.FastMCP`) is always available too.
+mcp            = ["fastmcp>=2.0"]
+"pydantic-ai"  = ["pydantic-ai-slim>=0.1"]
+"openai-agents" = ["openai-agents>=0.1"]
+"claude-agent" = ["claude-agent-sdk>=0.1"]
+# One install wires every framework adapter (and the MCP server).
+agent          = ["indx[mcp]", "indx[langchain]", "indx[pydantic-ai]",
+                  "indx[openai-agents]", "indx[claude-agent]"]
+# The `indx app` web tester (docs/app-spec.md): a local FastAPI server that serves a bundled
+# Next.js static UI + a JSON/SSE API. Node is a *build-time-only* dep (it produces the static
+# bundle); runtime needs only these two pure-Python-ish wheels.
+app          = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
+# The cloud default stack (openai:gpt-5-mini + text-embedding-3-small); needs OPENAI_API_KEY.
+cloud        = ["indx[docling]", "indx[openai]", "indx[qdrant]"]
+# The air-gapped local profile.
+local        = ["indx[docling]", "indx[ollama]", "indx[bge]", "indx[qdrant]"]
+defaults     = ["indx[local]"]  # back-compat alias for the local profile bundle
+# Union of every extra above (file-architecture §5: indx[all] = everything).
+all          = ["indx[docling]", "indx[unstructured]", "indx[llamaparse]", "indx[markitdown]",
+                "indx[ollama]", "indx[vllm]", "indx[openai]", "indx[anthropic]", "indx[litellm]",
+                "indx[azure]",
+                "indx[qwen-vl]", "indx[vlm-local]", "indx[bge]", "indx[e5]", "indx[cohere]",
+                "indx[qdrant]", "indx[pgvector]", "indx[chroma]", "indx[lancedb]",
+                "indx[langchain]", "indx[llamaindex]", "indx[app]",
+                "indx[mcp]", "indx[pydantic-ai]", "indx[openai-agents]", "indx[claude-agent]",
+                "indx[aws]", "indx[aws-opensearch]",
+                "indx[gcp]", "indx[gcp-vectorsearch]"]
+dev          = ["pytest>=8", "pytest-cov", "mypy", "ruff", "nox", "numpy", "pyyaml"]
+
+# --- First-party slot registrations advertised as entry points (registry discovers these). ---
+# Mirrors registry/builtins.py exactly so plugin/name-resolution parity holds (file-architecture §6).
+[project.entry-points."indx.parsers"]
+plaintext    = "indx.parsers.plaintext:PlainTextParser"
+docling      = "indx.parsers.docling:DoclingParser"
+unstructured = "indx.parsers.unstructured:UnstructuredParser"
+llamaparse   = "indx.parsers.llamaparse:LlamaParseParser"
+markitdown   = "indx.parsers.markitdown:MarkItDownParser"
+textract     = "indx.parsers.textract:TextractParser"
+docintel     = "indx.parsers.docintel:DocumentIntelligenceParser"
+docai        = "indx.parsers.docai:DocumentAIParser"
+
+[project.entry-points."indx.llms"]
+none      = "indx.llm.none:NullLLM"
+openai    = "indx.llm.openai:OpenAILLM"
+ollama    = "indx.llm.ollama:OllamaLLM"
+anthropic = "indx.llm.anthropic:AnthropicLLM"
+litellm   = "indx.llm.litellm:LiteLLMClient"
+vllm      = "indx.llm.vllm:VLLMClient"
+azure     = "indx.llm.azure:AzureOpenAILLM"
+bedrock   = "indx.llm.bedrock:BedrockLLM"
+vertex    = "indx.llm.vertex:VertexLLM"
+
+[project.entry-points."indx.vlms"]
+none       = "indx.vlm.none:NullVLM"
+gpt4o      = "indx.vlm.gpt4o:GPT4oVLM"
+"qwen-vl"  = "indx.vlm.qwen_vl:QwenVLClient"
+local      = "indx.vlm.local:LocalVLM"
+bedrock    = "indx.vlm.bedrock:BedrockVLM"
+azure      = "indx.vlm.azure:AzureOpenAIVLM"
+vertex     = "indx.vlm.vertex:VertexVLM"
+
+[project.entry-points."indx.embedders"]
+hash     = "indx.embed.hash_embedder:HashEmbedder"
+openai   = "indx.embed.openai:OpenAIEmbedder"
+"bge-m3" = "indx.embed.bge_m3:BGEM3Embedder"
+e5       = "indx.embed.e5:E5Embedder"
+cohere   = "indx.embed.cohere:CohereEmbedder"
+bedrock  = "indx.embed.bedrock:BedrockEmbedder"
+azure    = "indx.embed.azure:AzureOpenAIEmbedder"
+vertex   = "indx.embed.vertex:VertexEmbedder"
+litellm  = "indx.embed.litellm:LiteLLMEmbedder"
+
+[project.entry-points."indx.stores"]
+jsonl    = "indx.store.jsonl:JsonlStore"
+qdrant   = "indx.store.qdrant:QdrantStore"
+pgvector = "indx.store.pgvector:PgVectorStore"
+chroma   = "indx.store.chroma:ChromaStore"
+lancedb  = "indx.store.lancedb:LanceDBStore"
+s3vectors      = "indx.store.s3vectors:S3VectorsStore"
+opensearch     = "indx.store.opensearch:OpenSearchStore"
+"azure-search" = "indx.store.azure_search:AzureAISearchStore"
+bigquery       = "indx.store.bigquery:BigQueryStore"
+"vertex-vector" = "indx.store.vertex_vector:VertexVectorStore"
+
+[project.entry-points."indx.writers"]
+indx       = "indx.output.indx_writer:IndxWriter"
+jsonl      = "indx.output.jsonl_writer:JsonlWriter"
+langchain  = "indx.output.langchain:LangChainWriter"
+llamaindex = "indx.output.llamaindex:LlamaIndexWriter"
+
+[tool.hatch.version]
+path = "src/indx/_version.py"
+
+[tool.hatch.build.targets.sdist]
+# Without an explicit allowlist, hatchling's sdist sweeps in the entire working tree —
+# docsite/ (incl. node_modules), webapp/, .claude/worktrees/ (full repo copies), uv.lock,
+# .coverage — ballooning the PyPI source archive to ~78 MB / 8.5k files. Restrict it to the
+# buildable project: the package, its test suite, design docs, examples, and root metadata.
+# This is also exactly what `python -m build` needs to rebuild the wheel from the sdist.
+# Patterns are root-anchored (leading "/"): an unanchored "README.md"/"LICENSE" would
+# also match every docsite/node_modules/**/README.md and re-bloat the archive.
+include = [
+  "/src/indx",
+  "/tests",
+  "/examples",
+  "/noxfile.py",
+  "/README.md",
+  "/LICENSE",
+  "/NOTICE",
+  "/CHANGELOG.md",
+  "/CONTRIBUTING.md",
+  "/pyproject.toml",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/indx"]
+# `indx demo` ships a tiny sample corpus (handbook/, engineering/, people/) made of
+# non-.py files (*.md, *.txt) that are VCS-ignored, and `indx app` ships a Next.js static
+# bundle built into `src/indx/app/static/` (also gitignored — see scripts/build_webapp.sh).
+# Both are data-only and would be pruned from the wheel by default. `artifacts` whitelists
+# them against .gitignore/VCS filtering AND includes them in the wheel at the src-stripped
+# path (`indx/demo/corpus/...`, `indx/app/static/...`) — exactly the destination we need.
+#
+# Do NOT also list these under `force-include`: artifacts already places the files, and a
+# force-include of the same paths adds every file a SECOND time, which hatchling rejects
+# ("a second file is being added to the wheel archive at the same path"). The tracked
+# `src/indx/app/static/.gitkeep` placeholder (it keeps the gitignored dir present so a
+# bundle-less CI checkout still builds) made this surface first, but the corpus had the
+# same latent double-add.
+#
+# Net effect: `pip install indx` (no extras) yields a working `indx demo`; a wheel built
+# after the webapp build also carries the `indx app` UI. Runtime guards
+# `_require_demo_corpus` / `_require_app_static` in cli/app.py raise/degrade cleanly if a
+# build ever ships without them. NOTE: a real wheel-content assertion is CI-only — hatchling
+# is not in this offline venv (see docs/reference/11-packaging.md / noxfile `package`).
+artifacts = ["src/indx/demo/corpus/**", "src/indx/app/static/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "corpus: runs against the real-document corpus (offline, recorded heavy-model output)",
+  "integration: requires a real backend service (qdrant/postgres/ollama)",
+  "docker: requires Docker; exercises the packaged wheel in a clean container",
+  "live: hits real cloud services that need an API key/secret; nightly/manual only",
+  "extras: exercises an optional backend's REAL library (installed via its extra); no API key, may download public models; nightly/manual only",
+  "slow: > a few seconds; excluded from the fast inner loop",
+]
+# Default local run = unit + corpus, offline & deterministic. Heavy tiers are opt-in.
+addopts = "-m 'not integration and not docker and not live and not extras' --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# typer.Argument()/Option() in parameter defaults is the canonical Typer idiom.
+"src/indx/cli/*.py" = ["B008"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/indx"]

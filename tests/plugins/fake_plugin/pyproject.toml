@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "indx-fake-plugin"
+version = "0.0.1"
+description = "Minimal installable distribution used to test indx entry-point discovery."
+requires-python = ">=3.11"
+dependencies = ["indx"]
+
+# Advertises a store under the `indx.stores` group; after `pip install`, the registry
+# resolves `--store fake` to this class with no change to indx (file-architecture §6).
+[project.entry-points."indx.stores"]
+fake = "fake_plugin.store:FakeStore"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fake_plugin"]

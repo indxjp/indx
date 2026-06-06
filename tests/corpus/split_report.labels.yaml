@@ -1,0 +1,16 @@
+# Expected structure for the split_report corpus: one logical report split across files.
+corpus: split_report
+exercises: [continues]
+
+lineage:
+  quarterly-report-part-1.txt: []
+  quarterly-report-part-2.txt: []
+  quarterly-report-part-3.txt: []
+
+# Ordered `continues` chain (directed, by path).
+continues_chain:
+  - [quarterly-report-part-1.txt, quarterly-report-part-2.txt]
+  - [quarterly-report-part-2.txt, quarterly-report-part-3.txt]
+
+floors:
+  continues: { precision: 1.0, recall: 1.0 }

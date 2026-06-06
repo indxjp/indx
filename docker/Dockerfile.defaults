@@ -1,0 +1,13 @@
+# Adds the heavy default-stack EXTRAS on top of the core wheel (docling/bge/qdrant client).
+# Cached layer; rebuilt only on dependency bumps. NOTE: in this scaffold the heavy extras
+# are declared but their implementations are deferred, so this image is the placeholder for
+# when those backends land.
+ARG PYTHON_VERSION=3.12
+FROM python:${PYTHON_VERSION}-slim
+
+WORKDIR /app
+COPY dist/*.whl /tmp/
+# Real builds would: pip install "/tmp/<wheel>[defaults]"
+RUN pip install --no-cache-dir /tmp/*.whl
+
+ENTRYPOINT ["indx"]
