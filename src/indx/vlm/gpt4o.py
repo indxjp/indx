@@ -13,6 +13,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any
 
+from indx.errors import StageError
 from indx.utils.lazy import require_extra
 
 if TYPE_CHECKING:
@@ -29,6 +30,24 @@ _DEFAULT_PROMPT = "Describe this image in detail."
 logger = logging.getLogger(__name__)
 
 
+def _sniff_mime(image: bytes) -> str:
+    """Sniff the image MIME type from magic bytes, defaulting to ``image/png``.
+
+    OpenAI validates the declared ``data:`` URL content-type against the payload, so a
+    hard-coded ``image/png`` rejects valid JPEG/GIF/WebP figures (e.g. images extracted
+    from PDFs). Recognises PNG, JPEG, GIF and WebP; anything else falls back to PNG.
+    """
+    if image.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if image.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if image.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if image[:4] == b"RIFF" and image[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
+
+
 class GPT4oVLM:
     """OpenAI multimodal chat adapter that describes images (satisfies the VLM protocol).
 
@@ -39,6 +58,20 @@ class GPT4oVLM:
     """
 
     name = "gpt4o"
+
+    @staticmethod
+    def _is_reasoning_model(model: str) -> bool:
+        """Return ``True`` for models that reject custom ``temperature`` on Chat Completions.
+
+        The gpt-5 *reasoning* family and o-series models only accept their default temperature;
+        sending another value returns HTTP 400. The ``gpt-5-chat*`` variants accept a custom
+        ``temperature`` and reject ``reasoning_effort``, so they are carved out before the
+        ``gpt-5`` prefix test (mirrors :meth:`OpenAILLM._is_reasoning_model`).
+        """
+        name = model.lower()
+        if name.startswith("gpt-5-chat"):
+            return False
+        return name.startswith(("gpt-5", "o1", "o3", "o4"))
 
     def __init__(self, model: str | None = None) -> None:
         """Initialize the adapter.
@@ -79,14 +112,20 @@ class GPT4oVLM:
 
         Returns:
             The model's description text, or an empty string if the model returned none.
+
+        Raises:
+            StageError: If the OpenAI call fails (wrapped at the edge).
         """
         client = self._ensure_client()
         b64 = base64.b64encode(image).decode("ascii")
-        data_url = f"data:image/png;base64,{b64}"
-        resp = client.chat.completions.create(
-            model=self.model,
-            temperature=0.0,  # determinism (coding-standards §1.4)
-            messages=[
+        data_url = f"data:{_sniff_mime(image)};base64,{b64}"
+        # gpt-5/o-series reasoning models (gpt-5 is multimodal) reject a custom ``temperature``
+        # on Chat Completions; sending one returns HTTP 400. Only forward ``temperature`` for
+        # non-reasoning models (e.g. the default gpt-4o) and use ``reasoning_effort="minimal"``
+        # for reasoning ones (mirrors the LLM adapters).
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
                 {
                     "role": "user",
                     "content": [
@@ -95,6 +134,18 @@ class GPT4oVLM:
                     ],
                 }
             ],
-        )
-        # Convert vendor response -> core str AT THE EDGE.
-        return resp.choices[0].message.content or ""
+        }
+        if not self._is_reasoning_model(self.model):
+            kwargs["temperature"] = 0.0  # determinism (coding-standards §1.4)
+        else:
+            kwargs["reasoning_effort"] = "minimal"
+        try:
+            resp = client.chat.completions.create(**kwargs)
+        except Exception as exc:  # noqa: BLE001 — convert any vendor failure at the edge
+            raise StageError("enrich", f"{self.name} (vlm) failed: {exc}") from exc
+        # Convert vendor response -> core str AT THE EDGE. Guard against an empty
+        # choices list (content-filtered responses) so we never raise IndexError.
+        choices = getattr(resp, "choices", None) or []
+        if not choices:
+            return ""
+        return choices[0].message.content or ""

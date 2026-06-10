@@ -96,7 +96,11 @@ class TextractParser:
             raise StageError("parse", f"textract failed: {exc}", path=str(path)) from exc
 
         # Convert at the edge: vendor response dicts die here, only ParsedDoc escapes.
-        lines = [b["Text"] for b in resp["Blocks"] if b["BlockType"] == "LINE"]
+        lines = [
+            b["Text"]
+            for b in resp.get("Blocks", [])
+            if b.get("BlockType") == "LINE" and "Text" in b
+        ]
         blocks = [Block(kind="text", text=line, order=order) for order, line in enumerate(lines)]
         return ParsedDoc(
             source_path=str(path),

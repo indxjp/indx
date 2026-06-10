@@ -20,7 +20,8 @@ class JsonlWriter:
         _dump(dest / "chunks.jsonl", (c.model_dump() for c in space.chunks))
         _dump(dest / "relations.jsonl", (r.model_dump(mode="json") for r in space.relations))
         (dest / "manifest.json").write_text(
-            json.dumps(space.manifest.model_dump(), indent=2, sort_keys=True) + "\n"
+            json.dumps(space.manifest.model_dump(), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
 
 

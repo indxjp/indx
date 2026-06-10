@@ -6,25 +6,33 @@ adapter uses. The router is mounted under ``/api`` by :func:`indx.app.server.cre
 endpoints register their paths **without** the ``/api`` prefix.
 
 The build endpoint streams Server-Sent Events: the synchronous :class:`DirectoryPipeline` runs
-in a worker thread feeding a :class:`queue.Queue`, and the async generator drains it so each
-pipeline stage streams as it starts. Per-stage timing reuses the math from
-``cli/build.py::_run_json``.
+in a worker thread that forwards each frame onto the event loop via ``loop.call_soon_threadsafe``
+into an :class:`asyncio.Queue` (so no threadpool token is parked), and the async generator drains
+it so each pipeline stage streams as it starts. The consumer polls ``request.is_disconnected()``
+and a cooperative ``threading.Event`` stop flag halts the build at the next stage boundary on
+disconnect. Per-stage timing reuses the math from ``cli/build.py::_run_json``.
 """
 
 from __future__ import annotations
 
+import atexit
 import importlib.util
 import json
-import queue
+import os
 import tempfile
 import threading
 import time
-from collections.abc import AsyncIterator, Iterator, Mapping
+import zipfile
+from collections.abc import AsyncIterator, Mapping
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from indx import __version__
 from indx.app.models import (
+    AgentDocumentRequest,
+    AgentOverviewRequest,
+    AgentSearchRequest,
     BrowseEntry,
     BrowseResponse,
     BuildRequest,
@@ -35,14 +43,22 @@ from indx.app.models import (
     ConfigPutRequest,
     ConfigValidateResponse,
     DemoResponse,
+    DocumentDetail,
     DryRunDocument,
     DryRunResponse,
+    FrameworkInfo,
     HealthResponse,
+    ImportResponse,
     InspectDocument,
     InspectResponse,
     QueryRequest,
     QueryResponse,
+    RelationEdge,
+    SearchResults,
+    SnippetsResponse,
+    SpaceOverview,
     StageTiming,
+    ToolDef,
 )
 from indx.cli._render import load_space, writer_name
 from indx.config import Config, load_config
@@ -99,6 +115,94 @@ _OFFLINE_STACK: dict[str, str] = {
     "store": "jsonl",
     "format": ".indx",
 }
+
+
+# Cap the number of relation edges returned by ``/inspect`` so a pathological space cannot
+# produce an unbounded payload (the frontend renders a "showing N of M" notice).
+_EDGE_LIMIT = 2000
+
+# Hard cap on an uploaded file (``POST /api/import``). 512 MiB comfortably covers a real ``.indx``
+# artifact or a zipped corpus while bounding what a single request can spill onto disk.
+_MAX_UPLOAD_BYTES = 512 * 1024 * 1024
+
+# The name of the app-owned work dir (under the system temp root) every upload is written into.
+# A single shared dir keeps uploads off arbitrary paths and trivially auditable.
+_IMPORT_WORKDIR_PREFIX = "indx-app-import-"
+
+# Every app-created temp dir (build outputs, demo spaces, import work dir) is tracked here and
+# removed at interpreter exit. A build/demo/import each used to ``tempfile.mkdtemp`` a dir that
+# was never cleaned up, so a long-lived server — or many demo clicks — leaked a growing pile of
+# ``/tmp/indx-app-*`` dirs. ``_app_mkdtemp`` registers each; ``_cleanup_app_temp_dirs`` (run once
+# via ``atexit``) removes them on shutdown.
+_APP_TEMP_DIRS: set[str] = set()
+_CLEANUP_REGISTERED = False
+
+
+def _cleanup_app_temp_dirs() -> None:
+    """Best-effort removal of every app-owned temp dir created this process (atexit hook)."""
+    import shutil
+
+    for path in list(_APP_TEMP_DIRS):
+        shutil.rmtree(path, ignore_errors=True)
+        _APP_TEMP_DIRS.discard(path)
+
+
+def _app_mkdtemp(prefix: str) -> Path:
+    """``tempfile.mkdtemp`` that registers the new dir for cleanup at process exit."""
+    global _CLEANUP_REGISTERED
+    path = Path(tempfile.mkdtemp(prefix=prefix))
+    _APP_TEMP_DIRS.add(str(path))
+    if not _CLEANUP_REGISTERED:
+        atexit.register(_cleanup_app_temp_dirs)
+        _CLEANUP_REGISTERED = True
+    return path
+
+
+# Agent framework -> (pip extra, the module name(s) that prove the adapter is importable). An
+# install badge is "installed" iff ANY listed module imports (``mcp`` is satisfied by either
+# ``fastmcp`` or ``mcp``). Mirrors the lazy adapters in ``indx.agent`` (connector.py).
+_AGENT_FRAMEWORKS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("langchain", "langchain", ("langchain_core",)),
+    ("openai-agents", "openai-agents", ("agents",)),
+    ("pydantic-ai", "pydantic-ai", ("pydantic_ai",)),
+    ("claude-agent", "claude-agent", ("claude_agent_sdk",)),
+    ("mcp", "mcp", ("fastmcp", "mcp")),
+)
+
+# Copy-paste connector snippets surfaced by ``GET /api/agent/snippets``. Each is short, correct,
+# and routes through ``indx.agent.connect`` (or the ``indx`` CLI for the MCP server).
+_AGENT_SNIPPETS: dict[str, str] = {
+    "python": (
+        "from indx.agent import connect\n\n"
+        'conn = connect("space.indx")\n'
+        "print(conn.overview())\n"
+        'print(conn.search("your question", k=5))'
+    ),
+    "cli": "indx mcp space.indx",
+    "langchain": (
+        "from indx.agent import connect\n\n"
+        'tools = connect("space.indx").langchain()  # needs indx[langchain]\n'
+        "# pass `tools` to your LangChain agent / AgentExecutor"
+    ),
+    "llamaindex": (
+        "from indx.agent import connect\n\n"
+        'conn = connect("space.indx")\n'
+        "# expose conn.search / conn.get_document as LlamaIndex FunctionTools"
+    ),
+    "mcp": (
+        "from indx.agent import connect\n\n"
+        'connect("space.indx").serve()  # stdio MCP server; needs indx[mcp]'
+    ),
+}
+
+
+def _agent_frameworks() -> list[FrameworkInfo]:
+    """Build the framework install badges via ``importlib.util.find_spec`` (no imports)."""
+    out: list[FrameworkInfo] = []
+    for name, extra, modules in _AGENT_FRAMEWORKS:
+        installed = any(importlib.util.find_spec(m) is not None for m in modules)
+        out.append(FrameworkInfo(name=name, extra=extra, installed=installed))
+    return out
 
 
 def _static_present() -> bool:
@@ -191,8 +295,6 @@ def _config_from_env() -> Path | None:
     endpoints and the ``/config`` editor default to the same file the user named on launch,
     rather than silently falling back to ``./indx.toml``.
     """
-    import os
-
     raw = os.environ.get("INDX_APP_CONFIG")
     return Path(raw) if raw else None
 
@@ -209,8 +311,12 @@ def _components_of(cfg: Config) -> dict[str, str]:
     }
 
 
-def _make_pipeline(req: BuildRequest, cfg: Config, out: Path) -> Any:
-    """Construct a :class:`DirectoryPipeline` from a resolved config (mirrors build_command)."""
+def _make_pipeline(req: BuildRequest, cfg: Config, out: Path | None) -> Any:
+    """Construct a :class:`DirectoryPipeline` from a resolved config (mirrors build_command).
+
+    ``out`` may be ``None`` for a dry-run: ``plan`` walks only and never writes, so there is no
+    point allocating (and then leaking) a temp output dir for it.
+    """
     from indx.pipeline import DirectoryPipeline
 
     return DirectoryPipeline(
@@ -280,94 +386,108 @@ def _run_build_summary(
     )
 
 
-def _build_events(req: BuildRequest) -> Iterator[str]:
-    """Synchronous generator of SSE frames for a build, driven by a worker thread.
+class _BuildCancelled(Exception):
+    """Raised inside the worker's ``on_stage`` to bail at the next stage boundary on disconnect."""
 
-    The synchronous pipeline runs in a worker thread that pushes ``(event, data)`` tuples onto
-    a queue; this generator drains the queue and formats each as an SSE frame. ``dry_run``
-    emits a single ``plan`` event (no models run).
+
+def _run_build_worker(
+    req: BuildRequest,
+    emit: Any,
+    stop: threading.Event,
+) -> None:
+    """Run one build (or dry-run), pushing ``(event, data)`` SSE tuples through ``emit``.
+
+    ``emit`` is a thread-safe callback the caller uses to forward frames onto the event loop;
+    ``stop`` is a cooperative cancel flag honored at each stage boundary so a client disconnect
+    halts model/network/embedding work at the next stage instead of running the build to
+    completion. The temp output dir (when the caller did not pin ``out``) is removed if the build
+    is cancelled or fails before emitting ``done`` so disconnects don't orphan build outputs.
     """
-    events: queue.Queue[tuple[str, dict[str, Any]] | None] = queue.Queue()
+    out: Path | None = None
+    owns_out = False
+    emitted_done = False
+    try:
+        cfg = _resolve_config(req)
+        components = _components_of(cfg)
+        directory = Path(req.directory)
 
-    def worker() -> None:
-        try:
-            cfg = _resolve_config(req)
-            components = _components_of(cfg)
-            out = Path(req.out) if req.out else Path(tempfile.mkdtemp(prefix="indx-app-"))
-            directory = Path(req.directory)
-            pipeline = _make_pipeline(req, cfg, out)
-
-            if req.dry_run:
-                plan = pipeline.plan(directory)
-                events.put(
-                    (
-                        "plan",
-                        DryRunResponse(
-                            root=str(plan.root),
-                            documents=[
-                                DryRunDocument(
-                                    id=d.id,
-                                    path=d.path,
-                                    type=d.doc_type,
-                                    folder=d.folder,
-                                    size_bytes=d.size_bytes,
-                                )
-                                for d in plan.documents
-                            ],
-                            folders=plan.folders,
-                            components=plan.components,
-                            embed=plan.embed,
-                            enrich=plan.enrich,
-                        ).model_dump(mode="json"),
-                    )
-                )
-                return
-
-            events.put(
-                (
-                    "start",
-                    {
-                        "components": components,
-                        "directory": str(directory),
-                        "out": str(out),
-                    },
-                )
+        if req.dry_run:
+            # A dry-run walks only and never writes, so it needs no output dir (allocating one
+            # here would leak a temp dir on every Ingest keystroke that re-plans).
+            plan = _make_pipeline(req, cfg, None).plan(directory)
+            emit(
+                "plan",
+                DryRunResponse(
+                    root=str(plan.root),
+                    documents=[
+                        DryRunDocument(
+                            id=d.id,
+                            path=d.path,
+                            type=d.doc_type,
+                            folder=d.folder,
+                            size_bytes=d.size_bytes,
+                        )
+                        for d in plan.documents
+                    ],
+                    folders=plan.folders,
+                    components=plan.components,
+                    embed=plan.embed,
+                    enrich=plan.enrich,
+                ).model_dump(mode="json"),
             )
+            return
 
-            def on_stage(stage_name: str) -> None:
-                events.put(("stage", {"name": stage_name}))
+        if req.out:
+            out = Path(req.out)
+        else:
+            out = _app_mkdtemp("indx-app-")
+            owns_out = True
+        pipeline = _make_pipeline(req, cfg, out)
 
-            summary = _run_build_summary(
-                pipeline,
-                directory,
-                out,
-                req.name,
-                components,
-                writer_name(cfg.output.format),
-                on_stage,
-            )
-            events.put(("done", summary.model_dump(mode="json")))
-        except Exception as exc:  # noqa: BLE001 - surface any failure as an SSE error frame
-            events.put(("error", {"message": f"error: {exc}"}))
-        finally:
-            events.put(None)
+        emit(
+            "start",
+            {
+                "components": components,
+                "directory": str(directory),
+                "out": str(out),
+            },
+        )
 
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
+        def on_stage(stage_name: str) -> None:
+            if stop.is_set():
+                raise _BuildCancelled
+            emit("stage", {"name": stage_name})
 
-    while True:
-        item = events.get()
-        if item is None:
-            break
-        event, data = item
-        yield _sse(event, data)
+        summary = _run_build_summary(
+            pipeline,
+            directory,
+            out,
+            req.name,
+            components,
+            writer_name(cfg.output.format),
+            on_stage,
+        )
+        emit("done", summary.model_dump(mode="json"))
+        emitted_done = True
+    except _BuildCancelled:
+        pass  # client gone: stop quietly, the stream is already being torn down
+    except Exception as exc:  # noqa: BLE001 - surface any failure as an SSE error frame
+        emit("error", {"message": f"error: {exc}"})
+    finally:
+        # An output dir we created but never handed to the client (cancel/error before ``done``)
+        # is an orphan; remove it so a cancelled or failed build leaves nothing behind.
+        if owns_out and not emitted_done and out is not None:
+            import shutil
+
+            shutil.rmtree(out, ignore_errors=True)
+            _APP_TEMP_DIRS.discard(str(out))
+        emit(None, None)
 
 
 def build_router() -> APIRouter:
     """Build and return the ``/api`` :class:`APIRouter` (fastapi imported lazily here)."""
-    from fastapi import APIRouter, HTTPException, Query
-    from starlette.concurrency import iterate_in_threadpool
-    from starlette.responses import StreamingResponse
+    from fastapi import APIRouter, HTTPException, Query, Request
+    from starlette.responses import FileResponse, StreamingResponse
 
     from indx.errors import IndxError
 
@@ -432,24 +552,68 @@ def build_router() -> APIRouter:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(_to_toml(cfg.model_dump()), encoding="utf-8")
+        try:
+            rendered = _to_toml(_strip_none(cfg.model_dump()))
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            target.write_text(rendered, encoding="utf-8")
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return ConfigGetResponse(path=str(target), config=cfg.model_dump())
 
     @router.post("/build")
-    def build(req: BuildRequest) -> StreamingResponse:
-        # Drain the synchronous SSE generator on a worker thread so the event loop is free.
+    def build(req: BuildRequest, request: Request) -> StreamingResponse:
+        # The synchronous pipeline runs in a dedicated worker thread; it forwards each SSE frame
+        # onto the event loop via an ``asyncio.Queue`` (fed with ``call_soon_threadsafe``) so no
+        # threadpool token is parked blocking on the queue and the loop is never blocked. The
+        # consumer polls ``request.is_disconnected()`` between frames and sets a cooperative stop
+        # flag so a client disconnect halts the build at the next stage boundary instead of
+        # running model/embedding work to completion against an output nobody will receive.
         async def stream() -> AsyncIterator[str]:
-            async for frame in iterate_in_threadpool(_build_events(req)):
-                yield frame
+            import asyncio
+
+            loop = asyncio.get_running_loop()
+            channel: asyncio.Queue[tuple[str, dict[str, Any]] | None] = asyncio.Queue()
+            stop = threading.Event()
+
+            def emit(event: str | None, data: dict[str, Any] | None) -> None:
+                # Called from the worker thread; hop back onto the loop to touch the queue.
+                item = None if event is None else (event, data or {})
+                loop.call_soon_threadsafe(channel.put_nowait, item)
+
+            thread = threading.Thread(target=_run_build_worker, args=(req, emit, stop), daemon=True)
+            thread.start()
+            try:
+                while True:
+                    item = await channel.get()
+                    if item is None:
+                        break
+                    if await request.is_disconnected():
+                        stop.set()
+                        break
+                    event, data = item
+                    yield _sse(event, data)
+            finally:
+                # On any exit (disconnect, normal end, GeneratorExit) ask the worker to bail at the
+                # next stage boundary so it can't keep doing real work after the stream is gone.
+                stop.set()
 
         return StreamingResponse(stream(), media_type="text/event-stream")
+
+    # ``from __future__ import annotations`` stringizes the ``request`` annotation and ``Request``
+    # is local to this factory (not a module global), so FastAPI's ``get_type_hints`` cannot
+    # resolve it and would mistake ``request`` for a query param. Bind the real class so FastAPI
+    # injects the ASGI request and skips it during parameter solving (same as ``import_upload``).
+    build.__annotations__["request"] = Request
 
     @router.post("/dry-run", response_model=DryRunResponse)
     def dry_run(req: BuildRequest) -> DryRunResponse:
         try:
             cfg = _resolve_config(req)
-            out = Path(req.out) if req.out else Path(tempfile.mkdtemp(prefix="indx-app-"))
-            pipeline = _make_pipeline(req, cfg, out)
+            # ``plan`` walks only and never writes, so no output dir is needed (and none is
+            # allocated — the non-streaming dry-run used to leak one temp dir per request).
+            pipeline = _make_pipeline(req, cfg, None)
             plan = pipeline.plan(Path(req.directory))
         except IndxError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -475,17 +639,27 @@ def build_router() -> APIRouter:
     def inspect(space: str = Query(...)) -> InspectResponse:
         from collections import Counter
 
+        from pydantic import ValidationError
+
         try:
             ks = load_space(Path(space))
-        except IndxError as exc:
+        except (IndxError, json.JSONDecodeError, UnicodeDecodeError, ValidationError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         rel_counts = Counter(r.type.value for r in ks.relations)
+        # The graph payload: one edge per relation, capped so a pathological space can't blow up
+        # the response (the histogram above stays the full count for the legend).
+        edges = [
+            RelationEdge(source_id=r.src, target_id=r.dst, type=r.type.value)
+            for r in ks.relations[:_EDGE_LIMIT]
+        ]
         return InspectResponse(
             path=space,
             manifest=ks.manifest,
             stats=ks.stats,
             types=dict(ks.stats.types),
             relations=dict(rel_counts),
+            edges=edges,
+            edge_total=len(ks.relations),
             documents=[
                 InspectDocument(
                     id=d.id,
@@ -502,13 +676,18 @@ def build_router() -> APIRouter:
 
     @router.post("/query", response_model=QueryResponse)
     def query(req: QueryRequest) -> QueryResponse:
+        from pydantic import ValidationError
+
         try:
             ks = load_space(Path(req.space))
-        except IndxError as exc:
+        except (IndxError, json.JSONDecodeError, UnicodeDecodeError, ValidationError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Clamp k to >=1 so a negative/zero value can't silently slice from the end of the hit
+        # list (``hits[:-2]``); mirrors the agent connector's ``max(int(k), 1)`` clamp.
+        k = max(req.k, 1)
         # Over-fetch when filtering by type so the post-filter still returns k hits
         # (mirrors cli/query.py::query_command).
-        hits = ks.search(req.text, k=req.k * 5 if req.type else req.k)
+        hits = ks.search(req.text, k=k * 5 if req.type else k)
         kept = []
         for hit in hits:
             doc = ks.document(hit.chunk.doc_id)
@@ -516,17 +695,71 @@ def build_router() -> APIRouter:
             if req.type and (hit_type or "unknown") != req.type:
                 continue
             kept.append(hit)
-            if len(kept) >= req.k:
+            if len(kept) >= k:
                 break
         return QueryResponse(hits=kept)
+
+    # ----------------------------------------------------------------- agent
+    # Surfacing ``indx.agent`` (docs/app-backend-gaps.md §agent). Constructing the connector and
+    # serving overview/search/document pulls NO vendor SDKs; only ``/frameworks`` reports install
+    # state via ``find_spec``.
+
+    @router.get("/agent/frameworks", response_model=list[FrameworkInfo])
+    def agent_frameworks() -> list[FrameworkInfo]:
+        return _agent_frameworks()
+
+    @router.get("/agent/tools", response_model=list[ToolDef])
+    def agent_tools() -> list[ToolDef]:
+        from indx.agent.schema import TOOLS
+
+        return list(TOOLS)
+
+    @router.get("/agent/snippets", response_model=SnippetsResponse)
+    def agent_snippets() -> SnippetsResponse:
+        return SnippetsResponse(**_AGENT_SNIPPETS)
+
+    @router.post("/agent/overview", response_model=SpaceOverview)
+    def agent_overview(req: AgentOverviewRequest) -> SpaceOverview:
+        from indx.agent import connect
+
+        try:
+            conn = connect(Path(req.space))
+        except IndxError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return conn.overview(req.sample)
+
+    @router.post("/agent/search", response_model=SearchResults)
+    def agent_search(req: AgentSearchRequest) -> SearchResults:
+        from indx.agent import connect
+
+        try:
+            conn = connect(Path(req.space))
+        except IndxError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return conn.search(req.text, k=req.k, doc_type=req.doc_type)
+
+    @router.post("/agent/document")
+    def agent_document(req: AgentDocumentRequest) -> DocumentDetail | dict[str, str]:
+        from indx.agent import connect
+
+        try:
+            conn = connect(Path(req.space))
+        except IndxError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        detail = conn.get_document(req.path_or_id)
+        if detail is None:
+            # Sentinel, not a 500: the doc simply wasn't found (mirrors connector.call).
+            return {"error": f"no document matching {req.path_or_id!r}"}
+        return detail
 
     @router.post("/demo", response_model=DemoResponse)
     def demo() -> DemoResponse:
         import importlib.resources as resources
 
         corpus_ref = resources.files("indx.demo") / "corpus"
-        # Keep the output dir for the lifetime of the server so the UI can inspect/query it.
-        out = Path(tempfile.mkdtemp(prefix="indx-app-demo-"))
+        # Keep the output dir for the lifetime of the server so the UI can inspect/query it; it is
+        # registered for cleanup at process exit so repeated demo builds don't leak temp dirs.
+        out = _app_mkdtemp("indx-app-demo-")
         with resources.as_file(corpus_ref) as corpus_dir:
             req = BuildRequest(directory=str(corpus_dir), out=str(out), name="demo", offline=True)
             cfg = _resolve_config(req)
@@ -559,7 +792,130 @@ def build_router() -> APIRouter:
         parent = str(base.parent) if base.parent != base else None
         return BrowseResponse(path=str(base), parent=parent, entries=entries)
 
+    # ----------------------------------------------------------------- import / export
+    # Portability (docs/app-backend-gaps.md §io). Export streams a guarded ``.indx`` file;
+    # import saves a multipart upload under the app-owned work dir. Both stay vendor-free.
+
+    @router.get("/export")
+    def export(space: str = Query(...)) -> FileResponse:
+        try:
+            archive = _resolve_export_path(space)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return FileResponse(
+            path=archive,
+            media_type="application/octet-stream",
+            filename=archive.name,
+        )
+
+    @router.post("/import", response_model=ImportResponse)
+    async def import_upload(request: Request) -> ImportResponse:
+        # Reading the multipart form drives starlette's parser, which is backed by
+        # python-multipart (folded into the ``app`` extra); the ``file`` field carries the upload.
+        from starlette.datastructures import UploadFile
+
+        # Early-reject obviously-oversized requests via the declared Content-Length before parsing
+        # the form, so starlette's multipart parser does not spool the whole upload to disk first.
+        # The streaming loop below remains the authoritative bound for missing/under-declared sizes.
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared = int(content_length)
+            except ValueError:
+                declared = None
+            if declared is not None and declared > _MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"upload exceeds {_MAX_UPLOAD_BYTES} bytes",
+                )
+
+        form = await request.form()
+        upload = form.get("file")
+        if not isinstance(upload, UploadFile):
+            raise HTTPException(status_code=422, detail="missing multipart field 'file'")
+
+        safe_name = _sanitize_filename(upload.filename)
+        workdir = _import_workdir()
+        # Give each upload a unique basename so two uploads that sanitize to the same name (e.g.
+        # both ``corpus.zip``) can't overwrite or interleave onto a shared target — the first
+        # caller's returned path would otherwise point at the second caller's bytes. ``mkstemp``
+        # atomically reserves a fresh name (and creates the file) directly under the work dir.
+        fd, reserved = tempfile.mkstemp(dir=workdir, suffix=f"-{safe_name}")
+        os.close(fd)
+        target = Path(reserved)
+        # Stream the upload to disk in bounded chunks, aborting (and cleaning up) past the cap so
+        # a single request can never spill an unbounded amount onto disk.
+        written = 0
+        try:
+            with target.open("wb") as out_fh:
+                while True:
+                    chunk = await upload.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > _MAX_UPLOAD_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"upload exceeds {_MAX_UPLOAD_BYTES} bytes",
+                        )
+                    out_fh.write(chunk)
+        except BaseException:
+            # Any abort (over-cap 413, ClientDisconnect mid-upload, OSError such as ENOSPC/EIO)
+            # leaves a partial file under the shared work dir; remove it before re-raising so
+            # repeated failures don't accumulate orphaned partial uploads.
+            target.unlink(missing_ok=True)
+            raise
+        finally:
+            await upload.close()
+        # A ``.indx`` upload is a ready-to-inspect space; anything else is raw build input.
+        # Validate the archive up front rather than trusting the extension: a truncated, empty,
+        # or mis-renamed ``.indx`` would otherwise be reported as a ``space``, the UI would open it
+        # optimistically (success toast), and the failure would only surface one step later as a raw
+        # loader error referencing the internal temp path. Mirror the reader's contract here — a
+        # ``.indx`` must be a zip carrying ``manifest.json`` — and reject with a clean 400 so the
+        # caller hears about it immediately and keeps the upload affordance.
+        if target.suffix.lower() == ".indx":
+            if not _looks_like_indx_archive(target):
+                target.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{safe_name!r} is not a valid .indx archive "
+                        "(it must be a .indx export — a zip containing manifest.json)."
+                    ),
+                )
+            kind = "space"
+        else:
+            kind = "raw"
+        return ImportResponse(path=str(target), kind=kind)
+
+    # ``from __future__ import annotations`` stringizes the ``request`` annotation, and ``Request``
+    # is local to this factory (not in module globals), so FastAPI's ``get_type_hints`` cannot
+    # resolve it and would mistake ``request`` for a query param. Bind the real class so FastAPI
+    # recognizes it as the ASGI request and skips it during parameter solving.
+    import_upload.__annotations__["request"] = Request
+
     return router
+
+
+def _looks_like_indx_archive(path: Path) -> bool:
+    """Cheap structural check that ``path`` is a real ``.indx`` export.
+
+    Mirrors the archive reader's minimum contract (:func:`indx.archive.reader.read_archive`)
+    without fully loading the space: the file must be a zip that carries ``manifest.json``. This
+    catches the common bad uploads (truncated/empty/non-zip files, or an unrelated file renamed
+    to ``.indx``) at import time, while deeper validation (schema version, checksums) still
+    happens when the space is actually inspected.
+    """
+    from indx.archive import format as fmt
+
+    if not zipfile.is_zipfile(path):
+        return False
+    try:
+        with zipfile.ZipFile(path) as zf:
+            return fmt.MANIFEST in zf.namelist()
+    except zipfile.BadZipFile:
+        return False
 
 
 def _format_error(err: Mapping[str, Any]) -> str:
@@ -585,6 +941,106 @@ def _resolve_write_path(path: str | None) -> Path:
     if resolved != cwd and cwd not in resolved.parents:
         raise ValueError(f"refusing to write outside the working directory: {resolved}")
     return resolved
+
+
+def _is_exportable_location(resolved: Path) -> bool:
+    """Whether ``resolved`` is a path the export endpoint may stream from.
+
+    Allowed: the server's working-directory tree (where a user keeps their own spaces) **or** an
+    app-owned build dir under the system temp root. Every in-app build/demo/import writes to
+    ``tempfile.mkdtemp(prefix="indx-app-...")`` (api.py build/demo/import), so without the second
+    branch export is unreachable for anything the app itself produced. The temp branch still
+    requires an ``indx-app-`` path component, so a traversal into an unrelated ``/tmp`` file (or
+    ``/etc/passwd``) stays rejected.
+    """
+    cwd = Path.cwd().resolve()
+    if resolved == cwd or cwd in resolved.parents:
+        return True
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    if resolved == temp_root or temp_root in resolved.parents:
+        rel_parts = resolved.relative_to(temp_root).parts
+        return any(part.startswith("indx-app-") for part in rel_parts)
+    return False
+
+
+def _resolve_export_path(space: str) -> Path:
+    """Resolve a ``GET /api/export`` ``space`` to the ``.indx`` file to stream, guarded.
+
+    The resolved ``space`` must sit in an exportable location (:func:`_is_exportable_location`):
+    the server's working-directory tree or an app-owned build dir under the system temp root. A
+    traversal path (``../../etc``) is rejected with a :class:`ValueError`. A directory is allowed
+    and the single ``.indx`` inside it is located; a bare ``.indx`` file is streamed directly.
+    """
+    cwd = Path.cwd().resolve()
+    candidate = Path(space).expanduser()
+    if not candidate.is_absolute():
+        candidate = cwd / candidate
+    resolved = candidate.resolve()
+    if not _is_exportable_location(resolved):
+        raise ValueError(f"refusing to export outside the working directory: {resolved}")
+    if not resolved.exists():
+        raise ValueError(f"no such space: {space}")
+    if resolved.is_file():
+        # Only stream actual ``.indx`` artifacts, matching the directory branch's ``*.indx``
+        # constraint — never an arbitrary readable file (e.g. ``indx.toml``) under an allowed root.
+        if resolved.suffix.lower() != ".indx":
+            raise ValueError(f"not an .indx artifact: {space}")
+        return resolved
+    # A built space is a directory holding the self-contained ``.indx`` artifact.
+    archives = sorted(resolved.glob("*.indx"))
+    if not archives:
+        raise ValueError(f"no .indx artifact found under: {space}")
+    return archives[0]
+
+
+@lru_cache(maxsize=1)
+def _import_workdir() -> Path:
+    """The app-owned work dir every upload lands in, created once per server process.
+
+    A single private dir keeps uploads off arbitrary filesystem locations and makes the saved set
+    auditable. When ``INDX_APP_IMPORT_DIR`` is unset, a fresh ``tempfile.mkdtemp`` dir is used:
+    unpredictable name (no planted-symlink redirect) and mode 0700 (no cross-user reads of private
+    corpora/embeddings). When the env override is set (deployment pin / test isolation), a
+    pre-existing symlink is refused and the dir is locked to 0700. ``lru_cache`` keeps the chosen
+    dir stable across requests for the server's lifetime.
+    """
+    override = os.environ.get("INDX_APP_IMPORT_DIR")
+    if override:
+        base = Path(override)
+        if base.is_symlink():
+            raise ValueError(f"refusing symlinked import dir: {base}")
+        base.mkdir(parents=True, exist_ok=True)
+        os.chmod(base, 0o700)
+        return base.resolve()
+    # No env override: a fresh app-owned temp dir, registered for cleanup at process exit. (An
+    # explicit INDX_APP_IMPORT_DIR is the caller's to manage, so it is left untouched.)
+    return _app_mkdtemp(_IMPORT_WORKDIR_PREFIX).resolve()
+
+
+def _sanitize_filename(name: str | None) -> str:
+    """Reduce an uploaded filename to a safe basename (no dirs, no traversal, no leading dots).
+
+    Strips any path components (defeating ``../`` and absolute paths), keeps only a conservative
+    character set, and falls back to ``upload`` when nothing usable remains — so the saved file
+    can never escape the work dir or shadow a dotfile.
+    """
+    raw = (name or "").replace("\\", "/").rsplit("/", 1)[-1]
+    cleaned = "".join(c for c in raw if c.isalnum() or c in (".", "-", "_")).lstrip(".")
+    return cleaned or "upload"
+
+
+def _strip_none(data: dict[str, Any]) -> dict[str, Any]:
+    """Recursively drop keys whose value is ``None``.
+
+    ``_SlotConfig`` allows passthrough options (``ConfigDict(extra="allow")``), so a posted
+    config may carry an option set to JSON ``null`` that survives validation as ``None``.
+    ``tomli_w`` has no representation for ``None`` and would raise; the hand-rolled fallback
+    would silently coerce it to an empty string. Dropping ``None`` values keeps both
+    serializers consistent (an absent option).
+    """
+    return {
+        k: _strip_none(v) if isinstance(v, dict) else v for k, v in data.items() if v is not None
+    }
 
 
 def _to_toml(data: dict[str, Any]) -> str:
@@ -632,10 +1088,11 @@ def _fmt_scalar(value: Any) -> str:
     if isinstance(value, str):
         return _fmt_str(value)
     if isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, (dict, list, tuple)) or item is None:
+                raise ValueError("unsupported config value: array items must be scalars")
         return "[" + ", ".join(_fmt_scalar(v) for v in value) + "]"
-    if value is None:
-        return '""'
-    return _fmt_str(str(value))
+    raise ValueError(f"unsupported config value type: {type(value).__name__}")
 
 
 def _fmt_str(value: str) -> str:

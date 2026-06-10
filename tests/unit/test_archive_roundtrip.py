@@ -41,3 +41,31 @@ def test_reader_rejects_non_archive(tmp_path) -> None:
     bogus.write_text("not a zip")
     with pytest.raises(ArchiveError):
         read_archive(bogus)
+
+
+def test_roundtrip_preserves_unicode_line_separators(tmp_path) -> None:
+    """Text with U+2028/U+2029/U+0085 must survive write→read.
+
+    The writer emits one JSON object per ``\\n``-terminated line with
+    ``ensure_ascii=False``, so these >=0x20 separators are written literally inside a
+    row. The reader must split records only on ``\\n`` — splitting on
+    ``str.splitlines()`` would fragment the row and corrupt the whole archive.
+    """
+    from indx.archive import read_archive, write_archive
+    from indx.core.chunk import Chunk
+    from indx.core.document import Document
+    from indx.core.knowledge_space import KnowledgeSpace
+
+    # U+2028 LINE SEP, U+2029 PARAGRAPH SEP, U+0085 NEL: all >=0x20, so
+    # json.dumps(ensure_ascii=False) writes them literally; str.splitlines() splits on them.
+    nasty = "before\u2028line-sep\u2029para-sep\x85nel after"
+    space = KnowledgeSpace(
+        documents=[Document(id="d1", path="a.txt", summary=nasty)],
+        chunks=[Chunk(id="c1", doc_id="d1", position=0, text=nasty)],
+    )
+    dest = tmp_path / "u.indx"
+    write_archive(space, dest)
+    loaded = read_archive(dest)
+    assert len(loaded.chunks) == 1
+    assert loaded.chunks[0].text == nasty
+    assert loaded.documents_[0].summary == nasty

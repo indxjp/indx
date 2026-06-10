@@ -123,7 +123,10 @@ class KnowledgeConnector:
         results are filtered to that detected type, over-fetching first so a full ``k`` can
         still come back.
         """
-        k = k or self.default_k
+        try:
+            k = self.default_k if k is None else max(int(k), 1)
+        except (TypeError, ValueError):
+            k = self.default_k
         want_context = self.with_context if with_context is None else with_context
 
         raw = self._space.search(query, k=k * 5 if doc_type else k)
@@ -156,7 +159,11 @@ class KnowledgeConnector:
     def overview(self, sample: int = 10) -> SpaceOverview:
         """Summarize the space; the backbone of the ``indx_overview`` tool."""
         stats = self._space.stats
-        cards = [self._card(doc) for doc in self._space.documents()[: max(sample, 0)]]
+        try:
+            n = max(int(sample), 0)
+        except (TypeError, ValueError):
+            n = 10
+        cards = [self._card(doc) for doc in self._space.documents()[:n]]
         return SpaceOverview(
             name=self.name,
             documents=stats.documents,
@@ -181,7 +188,10 @@ class KnowledgeConnector:
             docs = self._space.documents()
             doc = next((d for d in docs if d.path == path_or_id), None)
             if doc is None:
-                doc = next((d for d in docs if d.path.endswith(path_or_id)), None)
+                doc = next(
+                    (d for d in docs if d.path == path_or_id or d.path.endswith("/" + path_or_id)),
+                    None,
+                )
         if doc is None:
             return None
 
@@ -231,17 +241,25 @@ class KnowledgeConnector:
         """
         args = arguments or {}
         if name == SEARCH_TOOL.name:
+            query = args.get("query")
+            if not isinstance(query, str) or not query:
+                return {"error": "missing required argument 'query'"}
             return self.search(
-                query=args["query"],
+                query=query,
                 k=args.get("k"),
                 doc_type=args.get("doc_type"),
             ).model_dump(mode="json")
         if name == OVERVIEW_TOOL.name:
-            return self.overview(sample=args.get("sample", 10)).model_dump(mode="json")
+            sample = args.get("sample")
+            sample = 10 if sample is None else sample
+            return self.overview(sample=sample).model_dump(mode="json")
         if name == GET_DOCUMENT_TOOL.name:
-            detail = self.get_document(args["path_or_id"])
+            path_or_id = args.get("path_or_id")
+            if not isinstance(path_or_id, str) or not path_or_id:
+                return {"error": "missing required argument 'path_or_id'"}
+            detail = self.get_document(path_or_id)
             if detail is None:
-                return {"error": f"no document matching {args['path_or_id']!r}"}
+                return {"error": f"no document matching {path_or_id!r}"}
             return detail.model_dump(mode="json")
         raise ValueError(f"unknown tool {name!r}; known tools: {[t.name for t in TOOLS]}")
 

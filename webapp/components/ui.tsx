@@ -25,13 +25,14 @@ export function Banner({
   kind,
   children,
 }: {
-  kind: 'error' | 'success' | 'info';
+  kind: 'error' | 'success' | 'info' | 'warning';
   children: React.ReactNode;
 }) {
   const styles: Record<string, string> = {
     error: 'border-rose-200 bg-rose-50 text-rose-700',
     success: 'border-emerald-200 bg-emerald-50 text-emerald-700',
     info: 'border-sky-200 bg-sky-50 text-sky-700',
+    warning: 'border-amber-200 bg-amber-50 text-amber-700',
   };
   return (
     <div
@@ -89,7 +90,7 @@ export function BarChart({
 }
 
 /** Modal directory picker built on /api/browse. */
-import { useState, useCallback } from 'react';
+import { useState, useCallback, createContext, useContext, type ReactNode } from 'react';
 import { api } from '@/lib/api';
 import type { BrowseResponse } from '@/lib/types';
 
@@ -203,6 +204,211 @@ export function BrowseModal({
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+/** Right-side slide-over drawer. ESC closes; focus trapped like BrowseModal. */
+export function Drawer({
+  open,
+  title,
+  onClose,
+  children,
+}: {
+  open: boolean;
+  title?: React.ReactNode;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onClose();
+        return;
+      }
+      if (e.key === 'Tab') {
+        const root = panelRef.current;
+        if (!root) return;
+        const focusable = root.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), textarea, input, select, [tabindex]:not([tabindex="-1"])',
+        );
+        if (focusable.length === 0) {
+          e.preventDefault();
+          root.focus();
+          return;
+        }
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        const active = document.activeElement;
+        if (e.shiftKey && active === first) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && active === last) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    panelRef.current?.focus();
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex justify-end bg-black/40"
+      onClick={onClose}
+    >
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={typeof title === 'string' ? title : 'Details'}
+        tabIndex={-1}
+        className="flex h-full w-full max-w-md flex-col bg-white shadow-xl outline-none"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+          <h3 className="text-sm font-semibold text-ink">{title}</h3>
+          <button className="btn-ghost px-2 py-1" onClick={onClose} aria-label="Close">
+            ✕
+          </button>
+        </div>
+        <div className="flex-1 overflow-auto p-4">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+/** Loading placeholder block. */
+export function Skeleton({ className }: { className?: string }) {
+  return (
+    <div
+      aria-hidden="true"
+      className={`animate-pulse rounded-md bg-slate-100 ${className ?? 'h-4 w-full'}`}
+    />
+  );
+}
+
+/** Copies text to the clipboard, briefly showing a confirmation. */
+export function CopyButton({ text, label = 'Copy' }: { text: string; label?: string }) {
+  const [copied, setCopied] = useState(false);
+  const timerRef = useRef<number | undefined>(undefined);
+
+  const onCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      if (timerRef.current) window.clearTimeout(timerRef.current);
+      timerRef.current = window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setCopied(false);
+    }
+  }, [text]);
+
+  useEffect(() => () => {
+    if (timerRef.current) window.clearTimeout(timerRef.current);
+  }, []);
+
+  return (
+    <button
+      type="button"
+      className="btn-ghost px-2 py-1 text-xs"
+      onClick={onCopy}
+      aria-live="polite"
+    >
+      {copied ? 'Copied' : label}
+    </button>
+  );
+}
+
+/** A code block with a copy button. */
+export function CodeBlock({ code, lang }: { code: string; lang?: string }) {
+  return (
+    <div className="relative rounded-lg border border-slate-200 bg-slate-50 shadow-sm">
+      <div className="flex items-center justify-between border-b border-slate-200 px-3 py-1.5">
+        <span className="text-xs uppercase tracking-wide text-slate-400">
+          {lang ?? 'code'}
+        </span>
+        <CopyButton text={code} />
+      </div>
+      <pre className="overflow-auto p-3 text-xs leading-relaxed text-slate-800">
+        <code>{code}</code>
+      </pre>
+    </div>
+  );
+}
+
+export interface Toast {
+  id: number;
+  kind: 'info' | 'success' | 'error';
+  msg: string;
+}
+
+/** Toast queue hook; pair with <ToastHost/>. */
+export function useToasts() {
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const nextId = useRef(0);
+
+  const push = useCallback((kind: Toast['kind'], msg: string) => {
+    const id = nextId.current++;
+    setToasts((prev) => [...prev, { id, kind, msg }]);
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 4000);
+  }, []);
+
+  return { toasts, push };
+}
+
+/** App-wide toast push function, provided by <ToastProvider/>. */
+const ToastContext = createContext<{
+  push: (kind: Toast['kind'], msg: string) => void;
+} | null>(null);
+
+/**
+ * Single shared toast host for the whole app. Mount once near the root; descendants emit
+ * toasts via useToast(). Centralizing the queue here avoids the trap of calling useToasts()
+ * in multiple components (each call has its own isolated state).
+ */
+export function ToastProvider({ children }: { children: ReactNode }) {
+  const { toasts, push } = useToasts();
+  return (
+    <ToastContext.Provider value={{ push }}>
+      {children}
+      <ToastHost toasts={toasts} />
+    </ToastContext.Provider>
+  );
+}
+
+/** Emit app-wide toasts. No-ops safely if no provider is mounted. */
+export function useToast(): { push: (kind: Toast['kind'], msg: string) => void } {
+  return useContext(ToastContext) ?? { push: () => {} };
+}
+
+/** Fixed bottom-right stack of toasts emitted by useToasts. */
+export function ToastHost({ toasts }: { toasts: Toast[] }) {
+  const styles: Record<Toast['kind'], string> = {
+    info: 'border-sky-200 bg-sky-50 text-sky-700',
+    success: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+    error: 'border-rose-200 bg-rose-50 text-rose-700',
+  };
+  return (
+    <div className="pointer-events-none fixed bottom-4 right-4 z-[60] flex flex-col gap-2">
+      {toasts.map((t) => (
+        <div
+          key={t.id}
+          role={t.kind === 'error' ? 'alert' : 'status'}
+          className={`pointer-events-auto rounded-md border px-3 py-2 text-sm shadow-sm ${styles[t.kind]}`}
+        >
+          {t.msg}
+        </div>
+      ))}
     </div>
   );
 }

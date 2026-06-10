@@ -45,6 +45,10 @@ from indx.utils.lazy import require_extra
 
 logger = logging.getLogger(__name__)
 
+# Vertex AI streaming upsert accepts at most ~10,000 datapoints/request; Google recommends
+# ~1,000/batch, so we slice large corpora to stay well under the cap.
+_BATCH = 1000
+
 
 class VertexVectorStore:
     """Vector store backed by Vertex AI Vector Search (a *deployed* index endpoint).
@@ -151,7 +155,10 @@ class VertexVectorStore:
             if self._dim is None:
                 self._dim = len(ready[0].embedding or [])
             index = self._aiplatform.MatchingEngineIndex(self._index_id)
-            index.upsert_datapoints(datapoints=datapoints)
+            # Slice into ~1,000-datapoint batches so a large corpus does not exceed the
+            # streaming upsert per-request cap (mirrors sibling cloud stores).
+            for i in range(0, len(datapoints), _BATCH):
+                index.upsert_datapoints(datapoints=datapoints[i : i + _BATCH])
         except Exception as exc:
             raise StageError("store", f"Vertex Vector Search upsert failed: {exc}") from exc
 

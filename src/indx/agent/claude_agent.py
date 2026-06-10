@@ -35,7 +35,7 @@ def to_claude_mcp_server(connector: KnowledgeConnector, *, name: str = "indx") -
     @tool(  # type: ignore[untyped-decorator]
         SEARCH_TOOL.name,
         SEARCH_TOOL.description,
-        {"query": str, "k": int, "doc_type": str},
+        SEARCH_TOOL.parameters,
     )
     async def search(args: dict[str, Any]) -> dict[str, Any]:
         return _text_result(
@@ -49,11 +49,15 @@ def to_claude_mcp_server(connector: KnowledgeConnector, *, name: str = "indx") -
             )
         )
 
-    @tool(OVERVIEW_TOOL.name, OVERVIEW_TOOL.description, {"sample": int})  # type: ignore[untyped-decorator]
+    @tool(OVERVIEW_TOOL.name, OVERVIEW_TOOL.description, OVERVIEW_TOOL.parameters)  # type: ignore[untyped-decorator]
     async def overview(args: dict[str, Any]) -> dict[str, Any]:
         return _text_result(connector.call(OVERVIEW_TOOL.name, {"sample": args.get("sample", 10)}))
 
-    @tool(GET_DOCUMENT_TOOL.name, GET_DOCUMENT_TOOL.description, {"path_or_id": str})  # type: ignore[untyped-decorator]
+    @tool(  # type: ignore[untyped-decorator]
+        GET_DOCUMENT_TOOL.name,
+        GET_DOCUMENT_TOOL.description,
+        GET_DOCUMENT_TOOL.parameters,
+    )
     async def get_document(args: dict[str, Any]) -> dict[str, Any]:
         return _text_result(
             connector.call(GET_DOCUMENT_TOOL.name, {"path_or_id": args["path_or_id"]})

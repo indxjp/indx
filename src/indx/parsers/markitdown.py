@@ -70,7 +70,7 @@ class MarkItDownParser:
             raise StageError("parse", f"markitdown failed: {exc}", path=str(path)) from exc
 
         # `result` is a vendor result object — it must not escape this method.
-        text = result.text_content
+        text = result.text_content or ""
         blocks: list[Block] = []
         for order, raw in enumerate(_split_paragraphs(text)):
             kind = "heading" if raw.startswith("#") else "text"

@@ -173,6 +173,34 @@ class ChromaStore:
         except Exception as exc:  # normalize vendor errors to a typed IndxError
             raise StageError("store", f"Chroma delete failed: {exc}") from exc
 
+    def close(self) -> None:
+        """Release the underlying Chroma client.
+
+        Chroma's persistent client holds on-disk SQLite/segment resources; not
+        releasing it leaks handles and can lock the path against a second client.
+        Idempotent: safe to call more than once. After ``close()`` the store must
+        not be used again.
+        """
+        client = getattr(self, "_client", None)
+        if client is not None:
+            # Prefer the vendor's own teardown if the installed version exposes one;
+            # otherwise drop the reference so the client is finalized promptly by GC.
+            closer = getattr(client, "_system", None)
+            try:
+                if closer is not None and hasattr(closer, "stop"):
+                    closer.stop()
+            except Exception:  # best-effort teardown; never raise from close()
+                logger.debug("Chroma client teardown raised; dropping reference", exc_info=True)
+            finally:
+                self._client = None
+                self._col = None
+
+    def __enter__(self) -> ChromaStore:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
 
 def _result_to_chunk(cid: str, document: str, metadata: object) -> Chunk:
     """Convert one Chroma query row back into a core :class:`Chunk`.

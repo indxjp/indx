@@ -90,12 +90,12 @@ class LlamaParseParser:
             StageError: If the LlamaParse call fails for any reason.
         """
         try:
-            documents = self._parser().load_data(str(path))
+            documents = self._parser().load_data(str(path)) or []
         except Exception as exc:  # vendor exception — translate at the edge
             raise StageError("parse", f"llamaparse failed: {exc}", path=str(path)) from exc
 
         # Convert at the edge: vendor Document objects die here, only ParsedDoc escapes.
-        markdown = "\n\n".join(doc.text for doc in documents)
+        markdown = "\n\n".join(getattr(doc, "text", "") or "" for doc in documents)
         blocks = [
             Block(
                 kind="heading" if raw.startswith("#") else "text",

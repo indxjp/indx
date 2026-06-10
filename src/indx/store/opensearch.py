@@ -123,8 +123,22 @@ class OpenSearchStore:
             )
             # Pre-size the index only when a dim is known; otherwise defer to the first
             # upsert so it is sized to a real vector's width (T10 lazy sizing).
-            if dim is not None and not self._client.indices.exists(index=self._index):
-                self._ensure_index(dim)
+            # On reopen of an already-populated index (dim unknown), recover the persisted
+            # width so search() before any upsert no longer raises spuriously.
+            if dim is not None:
+                if not self._client.indices.exists(index=self._index):
+                    self._ensure_index(dim)
+            elif self._client.indices.exists(index=self._index):
+                # The configured name may be an alias; resolve to the concrete index key.
+                mapping = self._client.indices.get_mapping(index=self._index)
+                resolved = self._index if self._index in mapping else next(iter(mapping), None)
+                props = (
+                    mapping.get(resolved, {}).get("mappings", {}).get("properties", {})
+                    if resolved is not None
+                    else {}
+                )
+                # Leave _dim as None if the index has no embedding field — do not crash.
+                self._dim = props.get("embedding", {}).get("dimension")
         except Exception as exc:  # normalize vendor errors to a typed IndxError
             raise StageError("store", f"OpenSearch initialization failed: {exc}") from exc
         logger.debug("initialized OpenSearch store index=%s dim=%s", index, dim)
@@ -173,19 +187,30 @@ class OpenSearchStore:
         ready = [c for c in chunks if c.embedding is not None]
         if not ready:
             return
+        from opensearchpy.helpers import (  # type: ignore[import-not-found]  # optional extra: aws-opensearch (lazy)
+            bulk,
+        )
+
         try:
             # Deferred sizing: if the index was never sized at construction (dim was
             # unknown), size it now to the first real vector's width — not a guess (T10).
             if self._dim is None:
                 self._ensure_index(len(ready[0].embedding or []))
             # Upsert-by-id: drop any prior docs carrying these chunk ids, then index.
-            self.delete([c.id for c in ready])
-            for i in range(0, len(ready), _BATCH):  # batch writes (coding-standards §14)
-                for c in ready[i : i + _BATCH]:
-                    self._client.index(
-                        index=self._index,
-                        body=_chunk_to_source(c),  # convert Chunk -> document AT THE EDGE
-                    )
+            # delete_by_query is asynchronous / eventually consistent on AOSS, so request
+            # a refresh to close the window before re-indexing the same ids — otherwise a
+            # re-upsert can leave stale duplicates a later search returns twice.
+            self.delete([c.id for c in ready], refresh=True)
+            # One bulk request per _BATCH slice (coding-standards §14): opensearchpy.helpers
+            # .bulk issues a single _bulk HTTP call per chunk of actions, so the slicing
+            # below maps to N/_BATCH requests, not one request per document.
+            for i in range(0, len(ready), _BATCH):
+                actions = [
+                    # convert Chunk -> document AT THE EDGE
+                    {"_index": self._index, "_source": _chunk_to_source(c)}
+                    for c in ready[i : i + _BATCH]
+                ]
+                bulk(self._client, actions)
         except StageError:
             raise
         except Exception as exc:
@@ -225,7 +250,7 @@ class OpenSearchStore:
         hits.sort(key=lambda h: (-h.score, h.chunk.id))
         return hits
 
-    def delete(self, chunk_ids: list[str]) -> None:
+    def delete(self, chunk_ids: list[str], *, refresh: bool = False) -> None:
         """Delete documents whose ``chunk_id`` matches, via a delete-by-query.
 
         Serverless collections carry the chunk id in ``_source`` rather than ``_id``, so
@@ -233,6 +258,10 @@ class OpenSearchStore:
 
         Args:
             chunk_ids: The ids of the chunks to remove. May be empty (a no-op).
+            refresh: When ``True``, ask OpenSearch to make the deletes visible before the
+                call returns, closing the eventual-consistency window so a subsequent
+                re-index of the same ids cannot race the (asynchronous) delete and leave
+                duplicates. Used by :meth:`upsert`'s delete-then-index path.
 
         Raises:
             StageError: If the OpenSearch delete call fails.
@@ -243,9 +272,36 @@ class OpenSearchStore:
             self._client.delete_by_query(
                 index=self._index,
                 body={"query": {"terms": {"chunk_id": list(chunk_ids)}}},
+                refresh=refresh,
             )
         except Exception as exc:
             raise StageError("store", f"OpenSearch delete failed: {exc}") from exc
+
+    def close(self) -> None:
+        """Release the underlying OpenSearch client and its connection pool.
+
+        The ``opensearchpy.OpenSearch`` client owns a ``RequestsHttpConnection`` pool;
+        in a long-lived process (e.g. ``indx app``) a per-build store whose client is
+        never closed leaks those pooled sockets until GC. Best-effort: call the vendor's
+        own ``close()`` if present, then drop the reference. Idempotent — safe to call
+        more than once. After ``close()`` the store must not be used again.
+        """
+        client = getattr(self, "_client", None)
+        if client is not None:
+            try:
+                closer = getattr(client, "close", None)
+                if callable(closer):
+                    closer()
+            except Exception:  # best-effort teardown; never raise from close()
+                logger.debug("OpenSearch client teardown raised; dropping reference", exc_info=True)
+            finally:
+                self._client = None
+
+    def __enter__(self) -> OpenSearchStore:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
 
 def _chunk_to_source(chunk: Chunk) -> dict[str, Any]:

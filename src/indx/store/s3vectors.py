@@ -34,6 +34,13 @@ logger = logging.getLogger(__name__)
 _DEFAULT_INDEX = "indx"
 _METRIC = "cosine"
 
+# AWS S3 Vectors hard per-request caps: PutVectors and DeleteVectors accept at most 500
+# vectors/keys per call, and QueryVectors caps topK at 100. Large corpora must be sliced into
+# batches or the real service rejects the call (the offline fake does not enforce these caps).
+_PUT_BATCH = 500
+_DELETE_BATCH = 500
+_MAX_TOPK = 100
+
 
 class S3VectorsStore:
     """Vector store backed by Amazon S3 Vectors (serverless vector bucket + index).
@@ -171,7 +178,10 @@ class S3VectorsStore:
                 }
                 for c in ready
             ]
-            self._put_vectors(bucket, vectors)
+            # AWS caps PutVectors at 500 vectors/call; slice so the per-batch retry/backoff
+            # in _put_vectors applies to each batch.
+            for i in range(0, len(vectors), _PUT_BATCH):
+                self._put_vectors(bucket, vectors[i : i + _PUT_BATCH])
         except StageError:
             raise
         except Exception as exc:
@@ -217,7 +227,9 @@ class S3VectorsStore:
         Returns:
             Up to ``k`` :class:`~indx.store.base.SearchHit`, highest score first (cosine
             ``score = 1 - distance``). Ties are broken on ``chunk.id`` so ordering is
-            deterministic across runs (coding-standards §1.4).
+            deterministic across runs (coding-standards §1.4). Note: AWS QueryVectors hard-caps
+            ``topK`` at 100 and offers no pagination, so a request for ``k > 100`` returns at most
+            100 hits; the truncation is logged at WARNING so it is never silent.
 
         Raises:
             StageError: If no bucket is configured, the store was never sized (no ``dim`` and no
@@ -232,12 +244,24 @@ class S3VectorsStore:
                 "S3 Vectors store has no dimension yet: upsert at least one vector "
                 "(or pass dim=) before searching.",
             )
+        # AWS QueryVectors hard-caps topK at 100 with no pagination, so we cannot honor a larger
+        # k no matter what. Don't shortchange the caller silently — warn so the cap is visible.
+        top_k = k
+        if k > _MAX_TOPK:
+            logger.warning(
+                "S3 Vectors caps QueryVectors topK at %d; requested k=%d truncated to %d "
+                "(this backend cannot return more — no pagination).",
+                _MAX_TOPK,
+                k,
+                _MAX_TOPK,
+            )
+            top_k = _MAX_TOPK
         try:
             resp = self._client.query_vectors(
                 vectorBucketName=bucket,
                 indexName=self._index,
                 queryVector={"float32": list(vector)},
-                topK=k,
+                topK=top_k,  # AWS caps QueryVectors topK at 100 (see warning above)
                 returnDistance=True,
                 returnMetadata=True,
             )
@@ -262,11 +286,34 @@ class S3VectorsStore:
             return
         bucket = self._require_bucket()
         try:
-            self._client.delete_vectors(
-                vectorBucketName=bucket, indexName=self._index, keys=list(chunk_ids)
-            )
+            # AWS caps DeleteVectors at 500 keys/call; slice into batches.
+            ids = list(chunk_ids)
+            for i in range(0, len(ids), _DELETE_BATCH):
+                self._client.delete_vectors(
+                    vectorBucketName=bucket, indexName=self._index, keys=ids[i : i + _DELETE_BATCH]
+                )
         except Exception as exc:
             raise StageError("store", f"S3 Vectors delete failed: {exc}") from exc
+
+    def close(self) -> None:
+        """Release the underlying boto3 ``s3vectors`` client and its connection pool.
+
+        A botocore client owns an HTTP connection pool; in a long-lived process (e.g.
+        ``indx app``) a per-build store whose client is never closed leaks those pooled
+        sockets until GC. Best-effort: call the vendor's own ``close()`` if present, then
+        drop the reference. Idempotent — safe to call more than once. After ``close()`` the
+        store must not be used again.
+        """
+        client = getattr(self, "_client", None)
+        if client is not None:
+            try:
+                closer = getattr(client, "close", None)
+                if callable(closer):
+                    closer()
+            except Exception:  # best-effort teardown; never raise from close()
+                logger.debug("S3 Vectors client teardown raised; dropping reference", exc_info=True)
+            finally:
+                self._client = None
 
 
 def _chunk_to_metadata(chunk: Chunk) -> dict[str, Any]:

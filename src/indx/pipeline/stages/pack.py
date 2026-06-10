@@ -8,6 +8,16 @@ from indx.embed.base import Embedder
 from indx.store.base import VectorStore
 
 
+def stamp_sources(ctx: SpaceContext) -> None:
+    """Stamp Source(path, folder, type) onto each chunk by matching doc_id."""
+    chunks = ctx.space.chunks
+    for doc in ctx.space.documents_:
+        src = Source(path=doc.path, folder=doc.folder, type=doc.doc_type)
+        for chunk in chunks:
+            if chunk.doc_id == doc.id:
+                chunk.source = src
+
+
 class PackStage:
     name = "embed-pack"
 
@@ -16,15 +26,11 @@ class PackStage:
         self.store = store
 
     def run(self, ctx: SpaceContext) -> SpaceContext:
-        chunks = ctx.space.chunks
         # Stamp provenance onto each chunk so ``hit.source`` (a shorthand for
         # ``hit.chunk.source``) carries path/folder/type — the documented SDK surface
         # (sdk.md §search, data-models.md §Source). Runs after enrich so ``doc_type`` is final.
-        for doc in ctx.space.documents_:
-            src = Source(path=doc.path, folder=doc.folder, type=doc.doc_type)
-            for chunk in chunks:
-                if chunk.doc_id == doc.id:
-                    chunk.source = src
+        stamp_sources(ctx)
+        chunks = ctx.space.chunks
         if chunks:
             vectors = self.embedder.embed([c.text for c in chunks])
             for chunk, vec in zip(chunks, vectors, strict=True):

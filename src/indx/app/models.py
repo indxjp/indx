@@ -11,9 +11,28 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from indx.agent.schema import (
+    DocumentCard,
+    DocumentDetail,
+    Hit,
+    SearchResults,
+    SpaceOverview,
+    ToolDef,
+)
 from indx.core.knowledge_space import Manifest
 from indx.core.stats import SpaceStats
 from indx.store.base import SearchHit
+
+# Re-export the agent schema models so the app's responses use the real shapes and callers can
+# import them from a single place (docs/app-backend-gaps.md §agent).
+__all__ = [
+    "DocumentCard",
+    "DocumentDetail",
+    "Hit",
+    "SearchResults",
+    "SpaceOverview",
+    "ToolDef",
+]
 
 # --------------------------------------------------------------------------- health
 
@@ -154,14 +173,24 @@ class InspectDocument(BaseModel):
     chunks: int
 
 
+class RelationEdge(BaseModel):
+    """One directed relation edge, document-to-document, for the relationship graph."""
+
+    source_id: str
+    target_id: str
+    type: str
+
+
 class InspectResponse(BaseModel):
-    """``GET /api/inspect`` — manifest, stats, histograms, and the document table."""
+    """``GET /api/inspect`` — manifest, stats, histograms, edges, and the document table."""
 
     path: str
     manifest: Manifest
     stats: SpaceStats
     types: dict[str, int]
     relations: dict[str, int]
+    edges: list[RelationEdge]
+    edge_total: int  # full relation count; ``edges`` may be capped, so the UI can report "N of M"
     documents: list[InspectDocument]
 
 
@@ -210,3 +239,62 @@ class BrowseResponse(BaseModel):
     path: str
     parent: str | None
     entries: list[BrowseEntry]
+
+
+# --------------------------------------------------------------------------- import/export
+
+
+class ImportResponse(BaseModel):
+    """``POST /api/import`` — where the upload landed under the app-owned work dir.
+
+    ``kind`` is ``"space"`` for an uploaded ``.indx`` artifact (feed it straight to
+    ``/api/inspect``) or ``"raw"`` for any other upload (a folder/zip the Ingest → build flow
+    consumes). ``path`` is the server-side absolute path to the saved file.
+    """
+
+    path: str
+    kind: str
+
+
+# --------------------------------------------------------------------------- agent
+
+
+class FrameworkInfo(BaseModel):
+    """``GET /api/agent/frameworks`` — one agent framework's install badge."""
+
+    name: str
+    extra: str
+    installed: bool
+
+
+class SnippetsResponse(BaseModel):
+    """``GET /api/agent/snippets`` — copy-paste connector snippets per framework."""
+
+    python: str
+    cli: str
+    langchain: str
+    llamaindex: str
+    mcp: str
+
+
+class AgentOverviewRequest(BaseModel):
+    """``POST /api/agent/overview`` request body."""
+
+    space: str
+    sample: int = 10
+
+
+class AgentSearchRequest(BaseModel):
+    """``POST /api/agent/search`` request body."""
+
+    space: str
+    text: str
+    k: int = 5
+    doc_type: str | None = None
+
+
+class AgentDocumentRequest(BaseModel):
+    """``POST /api/agent/document`` request body."""
+
+    space: str
+    path_or_id: str

@@ -13,6 +13,7 @@ Selecting this parser without the extra installed raises
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -70,6 +71,10 @@ class DoclingParser:
         # this module never crashes a light core install.
         require_extra("parser", "docling", "docling", "docling")
         self._converter: DocumentConverter | None = None
+        # Guards both the one-time converter build (construction race) and concurrent
+        # convert() calls, since DocumentConverter is not verified thread-safe and the
+        # default pipeline fans parse() across a ThreadPoolExecutor.
+        self._lock = threading.Lock()
 
     def parse(self, path: Path) -> ParsedDoc:
         """Parse one local file into a normalized :class:`ParsedDoc`.
@@ -86,7 +91,10 @@ class DoclingParser:
         """
         converter = self._get_converter()
         try:
-            result = converter.convert(str(path))
+            # Serialize convert() under the same lock: DocumentConverter is not verified
+            # safe for concurrent convert() on one instance under the default thread pool.
+            with self._lock:
+                result = converter.convert(str(path))
         except Exception as exc:  # vendor exception — translate at the edge (§8)
             raise StageError("parse", f"docling failed: {exc}", path=str(path)) from exc
 
@@ -106,12 +114,17 @@ class DoclingParser:
         Returns:
             The lazily-constructed Docling converter.
         """
+        # Double-checked locking: avoid N threads each building a heavyweight converter
+        # (and a nondeterministic last-writer instance) on the default parse path.
         if self._converter is None:
-            # Lazy: imported only when we actually parse, never at module top level.
-            # (Resolved for typing via the TYPE_CHECKING import above; optional extra: docling.)
-            from docling.document_converter import DocumentConverter
+            with self._lock:
+                if self._converter is None:
+                    # Lazy: imported only when we actually parse, never at module top level.
+                    # (Resolved for typing via the TYPE_CHECKING import above; optional
+                    # extra: docling.)
+                    from docling.document_converter import DocumentConverter
 
-            self._converter = DocumentConverter()
+                    self._converter = DocumentConverter()
         return self._converter
 
     def _to_blocks(self, document: object) -> list[Block]:

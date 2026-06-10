@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.metadata as md
 from typing import Any
 
+from indx.errors import RegistryError
 from indx.registry.builtins import STAGE_ENTRY_POINT_GROUP
 
 
@@ -22,12 +23,22 @@ def discover(group: str) -> dict[str, str]:
     return found
 
 
-def load_plugin(group: str, name: str) -> type | None:
-    """Load the class registered as ``name`` under ``group``, or ``None`` if absent."""
+def load_plugin(group: str, name: str) -> Any | None:
+    """Load the callable registered as ``name`` under ``group``, or ``None`` if absent.
+
+    A class or a factory function are both valid: the registry calls the returned object
+    with ``**kwargs``, so any callable works. A matched-but-non-callable entry point is a
+    plugin-author mistake (it points at a module/constant instead of a class/factory), so it
+    raises :class:`RegistryError` naming the entry point rather than returning ``None`` --
+    that keeps it distinguishable from "name absent" instead of degrading into a misleading
+    "unknown" error at the call site.
+    """
     for ep in md.entry_points(group=group):
         if ep.name == name:
             obj = ep.load()
-            return obj if isinstance(obj, type) else type(obj)
+            if not callable(obj):
+                raise RegistryError(f"entry point {group}:{name} = {ep.value!r} is not callable")
+            return obj
     return None
 
 

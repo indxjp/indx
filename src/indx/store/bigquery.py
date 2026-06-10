@@ -248,6 +248,24 @@ class BigQueryStore:
         except Exception as exc:
             raise StageError("store", f"BigQuery delete failed: {exc}") from exc
 
+    def close(self) -> None:
+        """Release the backing :class:`google.cloud.bigquery.Client`.
+
+        The client owns a pooled HTTP session (``requests``/``google-auth`` transport); a
+        store that is never closed leaks those connections until GC. Best-effort: call the
+        vendor's own ``close()`` if present, then drop the reference. Idempotent — safe to
+        call more than once. After ``close()`` the store must not be used again.
+        """
+        client = getattr(self, "_client", None)
+        if client is not None:
+            try:
+                closer = getattr(client, "close", None)
+                if callable(closer):
+                    closer()
+            except Exception:  # best-effort teardown; never raise from close()
+                _logger.debug("BigQuery client close failed", exc_info=True)
+            self._client = None
+
 
 def _row_to_chunk(row: Any) -> Chunk:
     """Convert a BigQuery result row back to a core :class:`Chunk` (vendor edge)."""

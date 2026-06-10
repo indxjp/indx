@@ -22,6 +22,9 @@ if TYPE_CHECKING:
 
 _TABLE = "indx"
 _METRIC = "cosine"
+# Cap rows/ids per LanceDB call: a single huge ``id IN (...)`` literal (or one giant add)
+# degrades or is rejected by DataFusion on the large file-based workloads this store targets.
+_BATCH = 256
 
 
 class LanceDBStore:
@@ -115,8 +118,11 @@ class LanceDBStore:
             # size it now to the first real vector's width — not a guess (T10).
             if self._table is None:
                 self._ensure_table(len(ready[0].embedding or []))
-            self._table.delete(_id_in_predicate([c.id for c in ready]))
-            self._table.add(rows)
+            ids = [c.id for c in ready]
+            for i in range(0, len(ids), _BATCH):
+                self._table.delete(_id_in_predicate(ids[i : i + _BATCH]))
+            for i in range(0, len(rows), _BATCH):
+                self._table.add(rows[i : i + _BATCH])
         except Exception as exc:
             raise StageError("store", str(exc)) from exc
 
@@ -169,7 +175,8 @@ class LanceDBStore:
         if not chunk_ids:
             return
         try:
-            self._table.delete(_id_in_predicate(chunk_ids))
+            for i in range(0, len(chunk_ids), _BATCH):
+                self._table.delete(_id_in_predicate(chunk_ids[i : i + _BATCH]))
         except Exception as exc:
             raise StageError("store", str(exc)) from exc
 

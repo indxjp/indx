@@ -37,6 +37,8 @@ _MODEL_DIMS: dict[str, int] = {
 _DEFAULT_MODEL = "amazon.titan-embed-text-v2:0"
 # Dimensions the Titan v2 ``dimensions`` knob accepts.
 _TITAN_V2_DIMS = frozenset({256, 512, 1024})
+# The Cohere embed API caps a single request at 96 input texts; sub-batch above this.
+_COHERE_MAX_INPUTS = 96
 
 
 class BedrockEmbedder:
@@ -139,8 +141,15 @@ class BedrockEmbedder:
     def _embed_titan(self, texts: list[str]) -> list[list[float]]:
         """Embed via Titan: one ``inputText`` per ``invoke_model`` call."""
         vectors: list[list[float]] = []
+        # Titan v1 only accepts ``inputText``; ``dimensions``/``normalize`` are V2-only and
+        # are rejected (ValidationException) by V1. Emit them only for V2.
+        is_v2 = self.model == "amazon.titan-embed-text-v2:0"
         for text in texts:
-            body = json.dumps({"inputText": text, "dimensions": self.dim, "normalize": True})
+            payload: dict[str, Any] = {"inputText": text}
+            if is_v2:
+                payload["dimensions"] = self.dim
+                payload["normalize"] = True
+            body = json.dumps(payload)
             try:
                 response = self._client.invoke_model(modelId=self.model, body=body)
                 out = json.loads(response["body"].read())
@@ -153,16 +162,29 @@ class BedrockEmbedder:
         return vectors
 
     def _embed_cohere(self, texts: list[str]) -> list[list[float]]:
-        """Embed via Cohere-on-Bedrock: the whole batch in one ``invoke_model`` call."""
-        body = json.dumps({"texts": texts, "input_type": self.input_type})
-        try:
-            response = self._client.invoke_model(modelId=self.model, body=body)
-            out = json.loads(response["body"].read())
-        except Exception as exc:  # normalize vendor errors to a typed IndxError
-            raise StageError("embed", f"Bedrock invoke_model failed: {exc}") from exc
-        emb = out.get("embeddings")
-        if emb is None:
-            raise StageError("embed", "Bedrock response missing 'embeddings'.")
-        # Cohere v3 returns {"float": [...]} ; older shapes return a bare list.
-        vectors = emb["float"] if isinstance(emb, dict) else emb
-        return [[float(x) for x in vector] for vector in vectors]
+        """Embed via Cohere-on-Bedrock: sub-batch at 96 inputs per ``invoke_model`` call.
+
+        The Cohere embed API rejects requests above 96 inputs, so slice the texts and
+        concatenate the per-batch vectors in input order.
+        """
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), _COHERE_MAX_INPUTS):
+            batch = texts[start : start + _COHERE_MAX_INPUTS]
+            body = json.dumps({"texts": batch, "input_type": self.input_type})
+            try:
+                response = self._client.invoke_model(modelId=self.model, body=body)
+                out = json.loads(response["body"].read())
+            except Exception as exc:  # normalize vendor errors to a typed IndxError
+                raise StageError("embed", f"Bedrock invoke_model failed: {exc}") from exc
+            emb = out.get("embeddings")
+            if emb is None:
+                raise StageError("embed", "Bedrock response missing 'embeddings'.")
+            # Cohere v3 returns {"float": [...]} ; older shapes return a bare list.
+            if isinstance(emb, dict):
+                batch_vectors = emb.get("float")
+                if batch_vectors is None:
+                    raise StageError("embed", "Bedrock Cohere response has no 'float' embeddings.")
+            else:
+                batch_vectors = emb
+            vectors.extend([float(x) for x in vector] for vector in batch_vectors)
+        return vectors

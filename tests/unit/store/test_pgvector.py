@@ -54,10 +54,18 @@ class _FakeConnection:
         self.rollbacks = 0
         self.registered = False
         self.fail_executemany = False
+        # When set, the next CREATE EXTENSION raises, simulating a managed Postgres role
+        # that lacks the privilege — the failure path that used to orphan the socket.
+        self.fail_create_extension = False
+        self.closed = False
 
     def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> _FakeCursor:
         params = params or ()
-        if "CREATE EXTENSION" in sql or "CREATE TABLE" in sql:
+        if "CREATE EXTENSION" in sql:
+            if self.fail_create_extension:
+                raise RuntimeError('permission denied to create extension "vector"')
+            return _FakeCursor([])
+        if "CREATE TABLE" in sql:
             return _FakeCursor([])
         if sql.startswith("SELECT"):
             query, _, k = params
@@ -90,14 +98,20 @@ class _FakeConnection:
     def rollback(self) -> None:
         self.rollbacks += 1
 
+    def close(self) -> None:
+        self.closed = True
+
 
 class _FakePsycopg(types.ModuleType):
     def __init__(self) -> None:
         super().__init__("psycopg")
         self.last_conn: _FakeConnection | None = None
+        # When set, the next connection fails its CREATE EXTENSION during __init__.
+        self.fail_next_setup = False
 
     def connect(self, dsn: str) -> _FakeConnection:
         conn = _FakeConnection()
+        conn.fail_create_extension = self.fail_next_setup
         self.last_conn = conn
         return conn
 
@@ -225,6 +239,43 @@ def test_upsert_rolls_back_on_write_failure(fake_pgvector: _FakePsycopg) -> None
     with pytest.raises(StageError):
         store.upsert([_chunk("a", [1.0, 0.0])])
     assert conn.rollbacks == 1
+
+
+def test_init_closes_connection_when_setup_fails(fake_pgvector: _FakePsycopg) -> None:
+    from indx.errors import StageError
+    from indx.store.pgvector import PgVectorStore
+
+    # CREATE EXTENSION fails (e.g. role lacks the privilege on managed Postgres). The
+    # connection was already opened, so __init__ must close it before re-raising rather
+    # than orphan the socket on a half-built object Python never finalizes.
+    fake_pgvector.fail_next_setup = True
+    with pytest.raises(StageError):
+        PgVectorStore("postgresql://x", dim=2)
+    conn = fake_pgvector.last_conn
+    assert conn is not None
+    assert conn.closed is True
+
+
+def test_close_releases_connection_and_is_idempotent(fake_pgvector: _FakePsycopg) -> None:
+    from indx.store.pgvector import PgVectorStore
+
+    store = PgVectorStore("postgresql://x", dim=2)
+    conn = fake_pgvector.last_conn
+    assert conn is not None
+    store.close()
+    assert conn.closed is True
+    # Second close must be a no-op, not an AttributeError on a nulled handle.
+    store.close()
+
+
+def test_context_manager_closes_on_exit(fake_pgvector: _FakePsycopg) -> None:
+    from indx.store.pgvector import PgVectorStore
+
+    with PgVectorStore("postgresql://x", dim=2) as store:
+        assert store is not None
+    conn = fake_pgvector.last_conn
+    assert conn is not None
+    assert conn.closed is True
 
 
 def test_construction_without_extra_raises_missing_extra() -> None:

@@ -56,6 +56,40 @@ def test_env_llm_passthrough_namespaces_under_toml_selector(
     assert cfg.slot_options()["llm"] == {"api_key": "env-key"}
 
 
+def test_cli_override_backend_keeps_env_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CLI ``--llm`` override that changes the backend must keep INDX_LLM__* passthrough.
+
+    The override is the highest-precedence layer, so it picks the effective backend. The
+    env passthrough must be namespaced under *that* backend, not the env/toml/default one,
+    otherwise ``slot_options()["llm"]`` (which reads the sub-table for the resolved backend)
+    silently drops the env-supplied secret.
+    """
+    monkeypatch.setenv("INDX_LLM__API_KEY", "env-key")
+
+    cfg = load_config(overrides={"llm": "anthropic:claude"})
+
+    assert cfg.enrich.llm == "anthropic:claude"
+    assert cfg.slot_options()["llm"] == {"api_key": "env-key"}
+
+
+def test_cloud_preset_override_keeps_vlm_env_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A preset-style ``--vlm`` override (folded into overrides) keeps INDX_VLM__* options."""
+    monkeypatch.setenv("INDX_VLM__API_KEY", "vlm-env-key")
+    monkeypatch.setenv("INDX_VLM__BASE_URL", "http://vlm/v1")
+
+    cfg = load_config(overrides={"vlm": "azure:gpt-4o"})
+
+    assert cfg.enrich.vlm == "azure:gpt-4o"
+    assert cfg.slot_options()["vlm"] == {
+        "api_key": "vlm-env-key",
+        "base_url": "http://vlm/v1",
+    }
+
+
 def test_toml_path_namespaces_llm_and_vlm_by_subtable(tmp_path: Path) -> None:
     """The TOML ``[enrich.<backend>]`` path still resolves per-adapter options."""
     (tmp_path / "indx.toml").write_text(

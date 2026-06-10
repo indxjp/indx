@@ -42,6 +42,8 @@ _VECTOR_FIELD = "contentVector"
 _PROFILE = "vp"
 _ALGORITHM = "alg"
 _SELECT = ["id", "content", "doc_id", "position", "prev_id", "next_id"]
+# Azure AI Search caps indexing requests at 1000 documents per call; batch to stay under it.
+_BATCH = 1000
 
 
 class AzureAISearchStore:
@@ -219,7 +221,9 @@ class AzureAISearchStore:
         else:
             self._ensure_index(self._dim)
         try:
-            self._search_client().merge_or_upload_documents(documents)
+            client = self._search_client()
+            for start in range(0, len(documents), _BATCH):
+                client.merge_or_upload_documents(documents[start : start + _BATCH])
         except Exception as exc:
             raise StageError("store", f"Azure AI Search upsert failed: {exc}") from exc
 
@@ -280,9 +284,29 @@ class AzureAISearchStore:
         if not chunk_ids:
             return
         try:
-            self._search_client().delete_documents([{"id": i} for i in chunk_ids])
+            client = self._search_client()
+            for start in range(0, len(chunk_ids), _BATCH):
+                client.delete_documents([{"id": i} for i in chunk_ids[start : start + _BATCH]])
         except Exception as exc:
             raise StageError("store", f"Azure AI Search delete failed: {exc}") from exc
+
+    def close(self) -> None:
+        """Release any resources the store holds.
+
+        Unlike the retained-client stores, this store keeps **no** persistent vendor
+        client on ``self``: a fresh ``SearchClient``/``SearchIndexClient`` is built and
+        discarded inside each call (:meth:`_search_client`, :meth:`_ensure_index`), so
+        there is no long-lived connection pool to drop here. This override is therefore an
+        explicit, idempotent no-op that completes the lifecycle contract callers rely on
+        (``with AzureAISearchStore(...) as store``); it is safe to call more than once.
+        """
+        return None
+
+    def __enter__(self) -> AzureAISearchStore:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
 
 def _chunk_to_document(chunk: Chunk) -> dict[str, Any]:

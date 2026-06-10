@@ -72,7 +72,7 @@ class DocumentAIParser:
         self,
         *,
         project: str | None = None,
-        location: str = "us",
+        location: str | None = None,
         processor_id: str | None = None,
     ) -> None:
         """Construct the adapter and verify the optional extra is installed.
@@ -144,7 +144,7 @@ class DocumentAIParser:
                     raw_document=documentai.RawDocument(content=path.read_bytes(), mime_type=mime),
                 )
             )
-            text = result.document.text
+            text = result.document.text or ""
         except Exception as exc:  # vendor exception — translate at the edge
             raise StageError("parse", f"docai failed: {exc}", path=str(path)) from exc
 

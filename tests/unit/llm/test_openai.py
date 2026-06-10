@@ -157,6 +157,30 @@ def test_complete_forwards_temperature_for_non_reasoning_model(
     assert "reasoning_effort" not in request
 
 
+@pytest.mark.parametrize("model", ["gpt-5-chat", "gpt-5-chat-latest"])
+def test_complete_treats_gpt5_chat_as_non_reasoning(
+    monkeypatch: pytest.MonkeyPatch, model: str
+) -> None:
+    # gpt-5-chat* are ordinary chat models: they accept a custom temperature and REJECT
+    # reasoning_effort. The startswith('gpt-5') prefix would otherwise misclassify them as
+    # reasoning models, so they must be carved out (see OpenAILLM._is_reasoning_model).
+    assert OpenAILLM._is_reasoning_model(model) is False
+
+    _install_fake_openai(monkeypatch)
+    adapter = OpenAILLM(model=model)
+
+    adapter.complete("body", max_tokens=64, temperature=0.7)
+
+    client = adapter._ensure_client()
+    request = client.last_request  # type: ignore[attr-defined]
+    assert request is not None
+    assert request["max_completion_tokens"] == 64
+    # Custom temperature is forwarded and the rejected reasoning_effort knob is never sent.
+    assert request["temperature"] == 0.7
+    assert "reasoning_effort" not in request
+    assert "max_tokens" not in request
+
+
 def test_complete_handles_none_content(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_openai(monkeypatch)
     sys.modules["openai"].OpenAI.reply = None  # type: ignore[attr-defined]

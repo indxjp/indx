@@ -1,129 +1,77 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api } from '@/lib/api';
 import type { HealthResponse } from '@/lib/types';
-import { ConfigTab } from '@/components/ConfigTab';
-import { BuildTab } from '@/components/BuildTab';
-import { InspectTab } from '@/components/InspectTab';
-import { QueryTab } from '@/components/QueryTab';
+import { StoreProvider, useStore } from '@/lib/store';
+import { ToastProvider } from '@/components/ui';
+import { Shell } from '@/components/Shell';
+import Library from '@/components/Library';
+import { IngestView } from '@/components/IngestView';
+import { OrganizeView } from '@/components/OrganizeView';
+import { AskView } from '@/components/AskView';
 
-type TabId = 'config' | 'build' | 'inspect' | 'query';
-
-const TABS: { id: TabId; label: string }[] = [
-  { id: 'config', label: 'Config' },
-  { id: 'build', label: 'Build' },
-  { id: 'inspect', label: 'Inspect' },
-  { id: 'query', label: 'Query' },
-];
-
-export default function Page() {
-  const [tab, setTab] = useState<TabId>('config');
+/**
+ * Inner app: reads the journey phase + theme from the store, fetches backend
+ * health once, and keeps all four phase views mounted so their local state
+ * survives navigation. Visibility is driven by `hidden` toggled on store.phase.
+ */
+function AppInner() {
+  const { phase, setPhase, theme, toggleTheme } = useStore();
   const [health, setHealth] = useState<HealthResponse | null>(null);
-  // Cross-tab handoffs: Build "Run demo" / summaries seed Inspect + Query.
-  const [spacePath, setSpacePath] = useState<string>('');
 
   useEffect(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
   }, []);
 
-  const goInspect = useCallback((path: string) => {
-    setSpacePath(path);
-    setTab('inspect');
-  }, []);
-
   return (
-    <div className="mx-auto min-h-full max-w-5xl px-4 py-6">
-      <header className="mb-6 flex flex-wrap items-end justify-between gap-3">
-        <div>
+    <Shell
+      phase={phase}
+      setPhase={setPhase}
+      health={health}
+      theme={theme}
+      onToggleTheme={toggleTheme}
+    >
+      <div className="mx-auto w-full max-w-5xl px-4 py-6">
+        {/* The Library phase has its own hero h1; hide this header there to avoid two h1s. */}
+        <header className="mb-6" hidden={phase === 'library'}>
           <h1 className="text-2xl font-bold tracking-tight text-ink">
-            indx <span className="text-accent">web tester</span>
+            INDX
           </h1>
-          <p className="mt-1 text-sm text-slate-500">
-            Configure a stack, run a build, then inspect and query the knowledge space.
+          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+            Turn a pile of files into an organized, AI-ready knowledge base you
+            can talk to.
           </p>
-        </div>
-        <div className="text-right text-xs text-slate-400">
-          {health ? (
-            <>
-              <div>
-                v{health.version} ·{' '}
-                <span className={health.static ? 'text-emerald-600' : 'text-amber-600'}>
-                  bundle {health.static ? 'present' : 'absent'}
-                </span>
-              </div>
-              <div className="text-emerald-600">backend ok</div>
-            </>
-          ) : (
-            <div className="text-rose-500">backend unreachable</div>
-          )}
-        </div>
-      </header>
+        </header>
 
-      <nav
-        className="mb-6 flex gap-1 rounded-lg border border-slate-200 bg-white p-1 shadow-sm"
-        role="tablist"
-        aria-label="Sections"
-      >
-        {TABS.map((t) => (
-          <button
-            key={t.id}
-            role="tab"
-            aria-selected={tab === t.id}
-            id={`tab-${t.id}`}
-            aria-controls={`panel-${t.id}`}
-            className={`flex-1 rounded-md px-4 py-2 text-sm font-medium transition ${
-              tab === t.id
-                ? 'bg-accent text-white shadow'
-                : 'text-slate-600 hover:bg-slate-100'
-            }`}
-            onClick={() => setTab(t.id)}
-          >
-            {t.label}
-          </button>
-        ))}
-      </nav>
+        <div hidden={phase !== 'library'}>
+          <Library />
+        </div>
+        <div hidden={phase !== 'ingest'}>
+          <IngestView />
+        </div>
+        <div hidden={phase !== 'organize'}>
+          <OrganizeView />
+        </div>
+        <div hidden={phase !== 'ask'}>
+          <AskView />
+        </div>
 
-      <main>
-        <div
-          role="tabpanel"
-          id="panel-config"
-          aria-labelledby="tab-config"
-          hidden={tab !== 'config'}
-        >
-          {tab === 'config' ? <ConfigTab /> : null}
-        </div>
-        <div
-          role="tabpanel"
-          id="panel-build"
-          aria-labelledby="tab-build"
-          hidden={tab !== 'build'}
-        >
-          {tab === 'build' ? <BuildTab onInspect={goInspect} /> : null}
-        </div>
-        <div
-          role="tabpanel"
-          id="panel-inspect"
-          aria-labelledby="tab-inspect"
-          hidden={tab !== 'inspect'}
-        >
-          {tab === 'inspect' ? (
-            <InspectTab spacePath={spacePath} onSpaceChange={setSpacePath} />
-          ) : null}
-        </div>
-        <div
-          role="tabpanel"
-          id="panel-query"
-          aria-labelledby="tab-query"
-          hidden={tab !== 'query'}
-        >
-          {tab === 'query' ? <QueryTab initialSpace={spacePath} /> : null}
-        </div>
-      </main>
+        <footer className="mt-10 text-center text-xs text-slate-400 dark:text-slate-500">
+          INDX · your knowledge base, organized and searchable · runs
+          locally, operates on local paths
+        </footer>
+      </div>
+    </Shell>
+  );
+}
 
-      <footer className="mt-10 text-center text-xs text-slate-400">
-        indx app · local web tester · operates on server-side paths
-      </footer>
-    </div>
+export default function Page() {
+  return (
+    <StoreProvider>
+      <ToastProvider>
+        <AppInner />
+      </ToastProvider>
+    </StoreProvider>
   );
 }

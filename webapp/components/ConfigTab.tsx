@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '@/lib/api';
+import { useStore } from '@/lib/store';
 import type {
   ComponentInfo,
   ComponentsResponse,
@@ -78,6 +79,7 @@ function storeSubTable(cfg: Record<string, unknown>): Record<string, unknown> {
 }
 
 export function ConfigTab() {
+  const { setPreset, setConfigPath } = useStore();
   const [components, setComponents] = useState<ComponentsResponse | null>(null);
   const [values, setValues] = useState<SlotValues>(emptyValues());
   const [backendJson, setBackendJson] = useState<string>('{}');
@@ -235,11 +237,15 @@ export function ConfigTab() {
     setSaveMsg(null);
     try {
       const res = await api.putConfig({ path: savePath, config: assembledConfig });
-      setSaveMsg({ kind: 'success', text: `Saved to ${res.path}` });
+      // Saving a hand-tuned stack switches the active preset to "Advanced" and points the
+      // build at this file (BuildRequest.config) instead of the offline/cloud defaults.
+      setConfigPath(res.path);
+      setPreset('custom');
+      setSaveMsg({ kind: 'success', text: `Saved to ${res.path} — using this for Advanced builds.` });
     } catch (e) {
       setSaveMsg({ kind: 'error', text: e instanceof Error ? e.message : String(e) });
     }
-  }, [savePath, assembledConfig]);
+  }, [savePath, assembledConfig, setConfigPath, setPreset]);
 
   if (loadError) {
     return <Banner kind="error">Failed to load config: {loadError}</Banner>;

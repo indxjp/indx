@@ -16,8 +16,19 @@ def iter_files(root: Path, *, follow_symlinks: bool = False) -> Iterator[Path]:
     """Yield files under ``root`` in a deterministic (sorted) order, skipping junk.
 
     Sorting matters: the walk order is part of the deterministic golden (testing-strategy §3.5).
+
+    When ``follow_symlinks`` is True, symlinked directories are traversed, but a set of
+    already-visited real paths is tracked so directory symlink cycles (e.g. ``a/loop -> ..``)
+    cannot trigger unbounded recursion.
     """
-    root = Path(root)
+    yield from _iter_files(Path(root), follow_symlinks=follow_symlinks, visited=set())
+
+
+def _iter_files(root: Path, *, follow_symlinks: bool, visited: set[Path]) -> Iterator[Path]:
+    real = root.resolve()
+    if real in visited:
+        return
+    visited.add(real)
     entries = sorted(root.iterdir(), key=lambda p: p.name)
     for entry in entries:
         if entry.is_symlink() and not follow_symlinks:
@@ -25,7 +36,7 @@ def iter_files(root: Path, *, follow_symlinks: bool = False) -> Iterator[Path]:
         if entry.is_dir():
             if entry.name in _IGNORE_DIRS:
                 continue
-            yield from iter_files(entry, follow_symlinks=follow_symlinks)
+            yield from _iter_files(entry, follow_symlinks=follow_symlinks, visited=visited)
         elif entry.is_file() and entry.name not in _IGNORE_FILES:
             yield entry
 

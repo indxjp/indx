@@ -13,6 +13,7 @@ from indx.pipeline.stages import (
     RelateStage,
     WalkStage,
 )
+from indx.pipeline.stages.chunk import _pack
 from indx.store.jsonl import JsonlStore
 
 
@@ -50,6 +51,20 @@ def test_relate_sibling_and_continues(empty_context, tmp_path) -> None:
     types = {r.type for r in ctx.space.relations}
     assert RelationType.SIBLING in types
     assert RelationType.CONTINUES in types
+
+
+def test_pack_hard_splits_oversized_paragraph() -> None:
+    # A single paragraph that has no \n\n boundary must still be bounded by max_chars.
+    pieces = _pack("x" * 2000, 800)
+    assert all(len(p) <= 800 for p in pieces)
+    assert "".join(pieces) == "x" * 2000  # deterministic, lossless reassembly
+    assert pieces == ["x" * 800, "x" * 800, "x" * 400]
+
+
+def test_pack_respects_max_chars_after_packing() -> None:
+    # Packed multi-paragraph pieces are also capped to max_chars.
+    text = "\n\n".join(["y" * 500, "z" * 500])
+    assert all(len(p) <= 300 for p in _pack(text, 300))
 
 
 def test_pack_sets_embeddings_and_manifest(empty_context, tmp_tree) -> None:

@@ -98,10 +98,10 @@ mcp            = ["fastmcp>=2.0"]
 # One install wires every framework adapter (and the MCP server).
 agent          = ["indx[mcp]", "indx[langchain]", "indx[pydantic-ai]",
                   "indx[openai-agents]", "indx[claude-agent]"]
-# The `indx app` web tester (docs/app-spec.md): a local FastAPI server that serves a bundled
-# Next.js static UI + a JSON/SSE API. Node is a *build-time-only* dep (it produces the static
-# bundle); runtime needs only these two pure-Python-ish wheels.
-app          = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
+# IndexApp (docs/app-spec.md): a local FastAPI server that serves a bundled Next.js static UI +
+# a JSON/SSE API. Node is a *build-time-only* dep (it produces the static bundle); runtime needs
+# only these wheels (python-multipart backs the import upload endpoint).
+app          = ["fastapi>=0.110", "uvicorn[standard]>=0.27", "python-multipart>=0.0.9"]
 # The cloud default stack (openai:gpt-5-mini + text-embedding-3-small); needs OPENAI_API_KEY.
 cloud        = ["indx[docling]", "indx[openai]", "indx[qdrant]"]
 # The air-gapped local profile.
@@ -203,6 +203,14 @@ include = [
   "/CONTRIBUTING.md",
   "/pyproject.toml",
 ]
+# `python -m build` (the release flow) builds the wheel FROM the sdist, so the sdist must
+# already carry the gitignored data the wheel needs — otherwise the wheel-from-sdist loses
+# it even though the wheel target whitelists it below. The demo corpus is tracked (rides in
+# via `/src/indx`), but the `indx app` Next.js bundle in src/indx/app/static/ is gitignored
+# (built by scripts/build_webapp.sh), so it must be whitelisted here the same way the wheel
+# target does. Mirror the wheel `artifacts` list. (0.0.1/0.0.2 wheels shipped `indx app`
+# with no UI for exactly this reason: the bundle never reached the sdist.)
+artifacts = ["src/indx/demo/corpus/**", "src/indx/app/static/**"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/indx"]

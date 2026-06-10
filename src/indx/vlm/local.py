@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 from indx.errors import StageError
 from indx.utils.lazy import require_extra
 from indx.utils.logging import get_logger
+from indx.vlm.gpt4o import _sniff_mime
 
 if TYPE_CHECKING:
     import httpx  # type: ignore[import-not-found, unused-ignore]  # optional extra: vlm-local
@@ -81,6 +82,27 @@ class LocalVLM:
             self._client = httpx.Client(base_url=self._base_url, timeout=self._timeout)
         return self._client
 
+    def close(self) -> None:
+        """Release the underlying ``httpx.Client`` connection pool.
+
+        The client owns a pool of live sockets; not releasing it leaks the pool
+        (httpx emits an "Unclosed client" warning at GC). Idempotent: safe to call
+        more than once. After ``close()`` the adapter may be reused — a fresh client
+        is lazily reconstructed on the next ``describe()``.
+        """
+        client = getattr(self, "_client", None)
+        if client is not None:
+            try:
+                client.close()
+            finally:
+                self._client = None
+
+    def __enter__(self) -> LocalVLM:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
     def describe(self, image: bytes, *, prompt: str | None = None) -> str:
         """Describe an image by POSTing it to the local VLM endpoint.
 
@@ -110,7 +132,7 @@ class LocalVLM:
                         {"type": "text", "text": prompt or _DEFAULT_PROMPT},
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{b64}"},
+                            "image_url": {"url": f"data:{_sniff_mime(image)};base64,{b64}"},
                         },
                     ],
                 }

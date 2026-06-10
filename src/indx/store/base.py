@@ -54,3 +54,20 @@ class VectorStore(Protocol):
         ...
 
     def delete(self, chunk_ids: list[str]) -> None: ...
+
+
+def close_store(store: object) -> None:
+    """Best-effort teardown for a vector store (the optional ``close()`` half of the contract).
+
+    ``close()`` is deliberately *not* part of the ``@runtime_checkable`` :class:`VectorStore`
+    surface above: backends that own no resources — and the many ``isinstance(store,
+    VectorStore)`` conformance checks across the suite — must keep passing without implementing
+    it. Instead this helper gives every caller (the pipeline, the CLI/app build workers) a single,
+    uniform way to release a store: if the backend defines ``close()`` (e.g. Chroma releases its
+    persistent client, Pgvector closes its connection), call it; otherwise do nothing. The default
+    is thus a no-op, exactly as a base-class ``close()`` would be. Idempotent and exception-safe so
+    teardown never masks the real result of a run.
+    """
+    close = getattr(store, "close", None)
+    if callable(close):
+        close()

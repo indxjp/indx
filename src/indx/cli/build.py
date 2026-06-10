@@ -6,9 +6,11 @@ import json
 import logging
 import time
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from indx.cli._render import console, writer_name
 from indx.config import load_config
@@ -109,9 +111,18 @@ def build_command(
 
     cfg = load_config(config, overrides=overrides)
 
+    # Resolve (and thereby validate) the output writer up front, before any pipeline work.
+    # cfg.output.format is a free-form string; a typo would otherwise surface only at the final
+    # write step — after walk/parse/enrich/embed have all run (wasted compute and, on the
+    # default/cloud stacks, real API spend). get_writer raises RegistryError (exit 3) for an
+    # unknown slot, so a bad --format now fails fast with the same error and exit code.
+    writer_slot = writer_name(cfg.output.format)
+    writer = get_writer(writer_slot)
+
     start = time.perf_counter()
     try:
         pipeline = DirectoryPipeline(
+            config=cfg,
             parser=cfg.parser.engine,
             llm=cfg.enrich.llm,
             vlm=cfg.enrich.vlm,
@@ -150,19 +161,19 @@ def build_command(
     }
 
     if json_out:
-        _run_json(pipeline, directory, out, name, components, start, writer_name(cfg.output.format))
+        _run_json(pipeline, directory, out, name, components, start, writer)
         return
 
     with console.status("[bold]indexing…"):
         space = pipeline.run(directory, on_stage=lambda s: console.log(f"stage: {s}"))
 
-    get_writer(writer_name(cfg.output.format)).write(space, Path(out), name=name)
+    writer.write(space, Path(out), name=name)
     elapsed = time.perf_counter() - start
 
     # Final summary (FR-CLI-7): counts, timing, components used.
     console.print(
         f"[green]✓[/green] {len(space.documents_)} docs · {len(space.chunks)} chunks · "
-        f"{len(space.relations)} relations → [bold]{out}[/bold] "
+        f"{len(space.relations)} relations → [bold]{escape(str(out))}[/bold] "
         f"([cyan]{elapsed:.2f}s[/cyan])"
     )
     console.print(
@@ -185,7 +196,9 @@ def _emit_offline_hint() -> None:
         "      a fully offline run is one flag away: add [bold]--offline[/bold] "
         "(no installs, zero-dependency core stack),"
     )
-    _stderr_console.print("      or install the stack with [bold]pip install indx[<extra>][/bold].")
+    _stderr_console.print(
+        "      or install the stack with [bold]pip install indx\\[<extra>][/bold]."
+    )
 
 
 def _emit_cloud_hint(cloud: str) -> None:
@@ -199,7 +212,7 @@ def _emit_cloud_hint(cloud: str) -> None:
         f"{cloud.upper()} stack that needs its SDK."
     )
     _stderr_console.print(
-        f"      install it in one step: [bold]pip install indx[{cloud}][/bold] "
+        f"      install it in one step: [bold]pip install indx\\[{cloud}][/bold] "
         "(then set that cloud's standard credentials in your environment)."
     )
 
@@ -211,7 +224,7 @@ def _run_json(
     name: str,
     components: dict[str, str],
     start: float,
-    writer_slot: str,
+    writer: Any,
 ) -> None:
     """Run the build with per-stage timings and print ONE JSON object to stdout.
 
@@ -227,7 +240,7 @@ def _run_json(
 
     space = pipeline.run(directory, on_stage=on_stage)
     stages_end = time.perf_counter()
-    get_writer(writer_slot).write(space, Path(out), name=name)
+    writer.write(space, Path(out), name=name)
     end = time.perf_counter()
 
     # Convert start-timestamps to per-stage durations: stage i runs until stage i+1 starts,
@@ -257,14 +270,14 @@ def _run_json(
 def _render_plan(plan: BuildPlan) -> None:
     """Print the dry-run plan: counts, folders, files, and selected components."""
     console.print(
-        f"[bold]plan[/bold] {plan.root}: {len(plan.documents)} files · "
+        f"[bold]plan[/bold] {escape(str(plan.root))}: {len(plan.documents)} files · "
         f"{len(plan.folders)} folders (dry-run, nothing written)"
     )
     for doc in plan.documents:
-        console.print(f"  {doc.path}")
+        console.print(f"  {escape(str(doc.path))}")
     comp = plan.components
     console.print(
-        f"  components: parser={comp['parser']} llm={comp['llm']} "
-        f"embedder={comp['embedder']} store={comp['store']} "
+        f"  components: parser={escape(comp['parser'])} llm={escape(comp['llm'])} "
+        f"embedder={escape(comp['embedder'])} store={escape(comp['store'])} "
         f"enrich={'on' if plan.enrich else 'off'} embed={'on' if plan.embed else 'off'}"
     )

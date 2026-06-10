@@ -2,6 +2,7 @@
 // (FastAPI serves the SPA + /api); proxied to :8000 in dev via next.config rewrites.
 
 import type {
+  AgentSearchResults,
   BrowseResponse,
   BuildRequest,
   ComponentsResponse,
@@ -9,11 +10,17 @@ import type {
   ConfigPutRequest,
   ConfigValidateResponse,
   DemoResponse,
+  DocumentDetail,
   DryRunResponse,
+  FrameworkInfo,
   HealthResponse,
+  ImportResponse,
   InspectResponse,
   QueryRequest,
   QueryResponse,
+  SnippetsResponse,
+  SpaceOverview,
+  ToolDef,
 } from './types';
 
 const BASE = '/api';
@@ -74,6 +81,70 @@ export const api = {
 
   browse: (path?: string): Promise<BrowseResponse> =>
     request(`/browse${path ? `?path=${encodeURIComponent(path)}` : ''}`),
+
+  // ------------------------------------------------------------------- agent
+  agent: {
+    frameworks: (): Promise<FrameworkInfo[]> => request('/agent/frameworks'),
+
+    tools: (): Promise<ToolDef[]> => request('/agent/tools'),
+
+    snippets: (): Promise<SnippetsResponse> => request('/agent/snippets'),
+
+    overview: (space: string, sample?: number): Promise<SpaceOverview> =>
+      request('/agent/overview', {
+        method: 'POST',
+        body: JSON.stringify({ space, sample }),
+      }),
+
+    search: (
+      space: string,
+      text: string,
+      k?: number,
+      doc_type?: string | null,
+    ): Promise<AgentSearchResults> =>
+      request('/agent/search', {
+        method: 'POST',
+        body: JSON.stringify({ space, text, k, doc_type }),
+      }),
+
+    document: (
+      space: string,
+      path_or_id: string,
+    ): Promise<DocumentDetail | { error: string }> =>
+      request('/agent/document', {
+        method: 'POST',
+        body: JSON.stringify({ space, path_or_id }),
+      }),
+  },
+
+  // ------------------------------------------------------------ export/import
+  /** URL for a .indx space download link (href on an <a>, not a fetch). */
+  exportUrl: (space: string): string =>
+    `${BASE}/export?space=${encodeURIComponent(space)}`,
+
+  /**
+   * POST /api/import as multipart/form-data. We use a raw fetch with FormData
+   * (not request<T>) so the browser sets the multipart boundary itself — never
+   * set content-type manually here.
+   */
+  importSpace: async (file: File): Promise<ImportResponse> => {
+    const form = new FormData();
+    form.append('file', file);
+    const res = await fetch(`${BASE}/import`, { method: 'POST', body: form });
+    if (!res.ok) {
+      let detail = `${res.status} ${res.statusText}`;
+      try {
+        const body = await res.json();
+        if (body && typeof body.detail === 'string') {
+          detail = body.detail;
+        }
+      } catch {
+        // non-JSON error body; keep the status line
+      }
+      throw new ApiError(detail, res.status);
+    }
+    return (await res.json()) as ImportResponse;
+  },
 };
 
 // --------------------------------------------------------------------------- SSE

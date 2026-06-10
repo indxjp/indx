@@ -24,7 +24,11 @@ from indx.core.context import SpaceContext
 from indx.core.document import Document
 from indx.core.relation import Relation, RelationType
 
-_PART = re.compile(r"(.*?)[ _-]?(?:part[ _-]?|p)?(\d+)\b", re.IGNORECASE)
+# A numbered "part" suffix: a base name followed by an explicit ``part``/``p`` marker and a
+# number (``guide-part2``, ``guide_p3``). The marker is required so bare numeric suffixes —
+# years (``report2024``), versions (``v2``), quarters (``q1``) — are NOT mistaken for parts,
+# preserving the module's high-precision contract.
+_PART = re.compile(r"(.+?)(?:[ _-]*part[ _-]?|[ _-]+p)(\d+)\b", re.IGNORECASE)
 _INDEX_STEMS = {"index", "readme", "_index", "overview"}
 
 # A markdown inline link target: the URL/path inside ``](...)``. We only keep the path part,
@@ -97,8 +101,10 @@ def _doc_text(ctx: SpaceContext, doc: Document) -> str | None:
 
 def _norm_path(path: str) -> str:
     """Forward-slash, lowercased, ``./`` and trailing-slash stripped — for matching mentions."""
-    p = path.replace("\\", "/").strip().lstrip("./").rstrip("/")
-    return p.lower()
+    p = path.replace("\\", "/").strip()
+    while p.startswith("./"):
+        p = p[2:]
+    return p.rstrip("/").lower()
 
 
 def _references(ctx: SpaceContext) -> list[Relation]:
@@ -171,8 +177,10 @@ def _resolve_mention(
     # A relative path that did not match a full path: try suffix-matching its basename, but only
     # accept it when that basename is itself globally unique (still high precision).
     matches = by_base.get(base, [])
-    if len(matches) == 1 and _norm_path(matches[0].path).endswith(cand):
-        return matches[0]
+    if len(matches) == 1:
+        stored = _norm_path(matches[0].path)
+        if stored == cand or stored.endswith("/" + cand):
+            return matches[0]
     return None
 
 

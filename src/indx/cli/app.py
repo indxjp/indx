@@ -166,7 +166,7 @@ def build(
         "--aws",
         help=(
             "Use the fully-managed AWS stack (Textract / Bedrock / S3 Vectors); "
-            "needs indx[aws] + AWS credentials. Mutually exclusive with the other presets."
+            "needs indx\\[aws] + AWS credentials. Mutually exclusive with the other presets."
         ),
     ),
     azure: bool = typer.Option(
@@ -174,7 +174,7 @@ def build(
         "--azure",
         help=(
             "Use the fully-managed Azure stack (Document Intelligence / Azure OpenAI / "
-            "Azure AI Search); needs indx[azure] + Azure credentials. "
+            "Azure AI Search); needs indx\\[azure] + Azure credentials. "
             "Mutually exclusive with the other presets."
         ),
     ),
@@ -183,7 +183,7 @@ def build(
         "--gcp",
         help=(
             "Use the fully-managed GCP stack (Document AI / Vertex Gemini / BigQuery); "
-            "needs indx[gcp] + Google ADC. Mutually exclusive with the other presets."
+            "needs indx\\[gcp] + Google ADC. Mutually exclusive with the other presets."
         ),
     ),
     json_out: bool = typer.Option(
@@ -348,11 +348,13 @@ def app_command(
         None, "--config", "-c", exists=True, help="indx.toml the editor opens with."
     ),
 ) -> None:
-    """Launch the local web tester: configure, build (live), inspect, and query (app-spec).
+    """Launch INDX: turn a folder into an organized, AI-ready knowledge base.
 
-    Starts a FastAPI server (the ``indx[app]`` extra) that exposes every INDX feature over a
-    small web UI. Requires ``fastapi``/``uvicorn``; if the front-end bundle has not been built
-    the API still serves and a hint is printed (the bundle is build-time only).
+    Opens a local app where you can curate your **Library**, **Ingest** a folder, let INDX
+    **Organize** it into a clean, AI-ready knowledge base, and **Ask** questions over it.
+    Runs on a FastAPI server (the ``indx\\[app]`` extra) and requires ``fastapi``/``uvicorn``;
+    if the front-end bundle has not been built the API still serves and a hint is printed
+    (the bundle is build-time only).
     """
     # Gate on the extra FIRST — a missing ``indx[app]`` raises MissingExtraError (a plain
     # IndxError → exit 1), exactly like every other extra.
@@ -373,6 +375,10 @@ def app_command(
 
     # Touch create_app so an obvious import/build error surfaces before uvicorn binds.
     _ = create_app
+    console.print(
+        "[bold]INDX[/bold] — your folder, organized into an AI-ready knowledge base "
+        "to explore and ask."
+    )
     console.print(f"[bold]indx app[/bold] → http://{host}:{port}  (Ctrl-C to stop)")
     serve(host=host, port=port, open_browser=open_browser)
 
@@ -405,6 +411,7 @@ def mcp_command(
     require_extra("agent connector", "mcp", "mcp", "mcp")
 
     from rich.console import Console
+    from rich.markup import escape
 
     from indx.agent import connect
 
@@ -413,7 +420,7 @@ def mcp_command(
     # corrupts the very first protocol exchange. Use stderr unconditionally (harmless for the
     # http transports too) so `indx mcp <archive>` is a drop-in MCP server for any client.
     Console(stderr=True).print(
-        f"[bold]indx mcp[/bold] → serving '[cyan]{connector.name}[/cyan]' over {transport} "
+        f"[bold]indx mcp[/bold] → serving '[cyan]{escape(connector.name)}[/cyan]' over {transport} "
         "(Ctrl-C to stop)",
     )
     connector.serve(transport=transport)

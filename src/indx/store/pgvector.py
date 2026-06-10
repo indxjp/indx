@@ -70,6 +70,9 @@ class PgVectorStore:
         )
 
         self.dim = dim
+        # Set before the try so a failure mid-setup still leaves a well-defined attr
+        # and the except block can release a half-open connection (no orphaned socket).
+        self._conn: Any = None
         try:
             self._conn = psycopg.connect(dsn)
             # pgvector requires the extension to exist and register_vector to be called
@@ -82,6 +85,13 @@ class PgVectorStore:
                 self._ensure_table(dim)
             self._conn.commit()
         except Exception as exc:  # normalize backend errors to a typed IndxError
+            # Close the connection opened above before re-raising; __init__ raising leaves
+            # a half-built object Python never finalizes, so the socket would leak.
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                finally:
+                    self._conn = None
             raise StageError("store", str(exc)) from exc
 
     def _ensure_table(self, dim: int) -> None:
@@ -204,6 +214,26 @@ class PgVectorStore:
             # is reusable rather than stuck "current transaction is aborted".
             self._conn.rollback()
             raise StageError("store", str(exc)) from exc
+
+    def close(self) -> None:
+        """Release the underlying Postgres connection.
+
+        Idempotent: safe to call more than once, and on a store whose ``__init__``
+        already released the connection on a setup failure. After ``close()`` the store
+        must not be used again.
+        """
+        conn = getattr(self, "_conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            finally:
+                self._conn = None
+
+    def __enter__(self) -> PgVectorStore:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
 
 def _chunk_to_payload(chunk: Chunk) -> dict[str, Any]:

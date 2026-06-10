@@ -57,6 +57,11 @@ class _FakeOpenSearch:
     def index(self, *, index: str, body: dict[str, Any]) -> None:
         self._docs.append(dict(body))
 
+    def bulk(self, body: Any, *args: Any, **kwargs: Any) -> Any:
+        # opensearchpy.helpers.bulk calls client.bulk(...) with a serialized payload; the
+        # fake instead receives the already-expanded actions from the helper stub below.
+        raise NotImplementedError  # pragma: no cover
+
     def search(self, *, index: str, body: dict[str, Any]) -> dict[str, Any]:
         query = body["query"]["knn"]["embedding"]["vector"]
         k = body["query"]["knn"]["embedding"]["k"]
@@ -66,9 +71,28 @@ class _FakeOpenSearch:
         scored.sort(key=lambda h: -h["_score"])
         return {"hits": {"hits": scored[:k]}}
 
-    def delete_by_query(self, *, index: str, body: dict[str, Any]) -> None:
+    def delete_by_query(self, *, index: str, body: dict[str, Any], refresh: bool = False) -> None:
+        self.last_delete_refresh = refresh
         ids = set(body["query"]["terms"]["chunk_id"])
         self._docs = [d for d in self._docs if d["chunk_id"] not in ids]
+
+
+def _make_bulk(counter: dict[str, int]):
+    """Build a fake ``opensearchpy.helpers.bulk`` that records its invocation count.
+
+    The real helper sends one ``_bulk`` HTTP request per call; here we just ingest each
+    action's ``_source`` into the fake client's docs and bump a counter so a test can
+    assert one bulk call per batch rather than one request per document.
+    """
+
+    def bulk(client: Any, actions: Any, *args: Any, **kwargs: Any) -> tuple[int, list[Any]]:
+        counter["calls"] += 1
+        acts = list(actions)
+        for action in acts:
+            client._docs.append(dict(action["_source"]))
+        return len(acts), []
+
+    return bulk
 
 
 class _FakeSession:
@@ -99,6 +123,15 @@ def fake_opensearch(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     ospy.AWSV4SignerAuth = _AWSV4SignerAuth  # type: ignore[attr-defined]
     ospy.RequestsHttpConnection = _RequestsHttpConnection  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "opensearchpy", ospy)
+
+    # opensearchpy.helpers.bulk is imported lazily inside upsert(); provide a fake that
+    # records how many times it is called so a test can assert true per-batch batching.
+    helpers = types.ModuleType("opensearchpy.helpers")
+    bulk_calls: dict[str, int] = {"calls": 0}
+    helpers.bulk = _make_bulk(bulk_calls)  # type: ignore[attr-defined]
+    ospy.helpers = helpers  # type: ignore[attr-defined]
+    ospy.bulk_calls = bulk_calls  # type: ignore[attr-defined]  # surfaced for assertions
+    monkeypatch.setitem(sys.modules, "opensearchpy.helpers", helpers)
 
     boto3 = types.ModuleType("boto3")
     boto3.Session = _FakeSession  # type: ignore[attr-defined]
@@ -203,6 +236,28 @@ def test_delete_removes_documents(fake_opensearch: types.ModuleType) -> None:
     store.upsert([_chunk("a", [1.0, 0.0]), _chunk("b", [0.0, 1.0])])
     store.delete(["a"])
     assert [h.chunk.id for h in store.search([1.0, 0.0], k=5)] == ["b"]
+
+
+def test_upsert_uses_one_bulk_request_per_batch(fake_opensearch: types.ModuleType) -> None:
+    # True batching: opensearchpy.helpers.bulk must be invoked once per _BATCH slice, not
+    # once per document. With 600 chunks and _BATCH=256 that is ceil(600/256) == 3 calls.
+    from indx.store.opensearch import _BATCH
+
+    store = _store(dim=2)
+    n = 2 * _BATCH + 50
+    store.upsert([_chunk(f"c{i}", [1.0, 0.0]) for i in range(n)])
+    expected = -(-n // _BATCH)  # ceil division
+    assert fake_opensearch.bulk_calls["calls"] == expected  # type: ignore[attr-defined]
+    assert expected < n  # sanity: fewer requests than documents
+
+
+def test_upsert_refreshes_delete_before_reindex(fake_opensearch: types.ModuleType) -> None:
+    # The delete-then-index path must close the AOSS eventual-consistency window by asking
+    # delete_by_query to refresh, otherwise a re-upsert can leave stale duplicates.
+    store = _store(dim=2)
+    store.upsert([_chunk("a", [1.0, 0.0])])
+    client: _FakeOpenSearch = store._client  # type: ignore[assignment]
+    assert client.last_delete_refresh is True
 
 
 def test_search_before_sizing_raises(fake_opensearch: types.ModuleType) -> None:
