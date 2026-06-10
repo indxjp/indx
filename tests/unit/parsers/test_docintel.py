@@ -70,17 +70,31 @@ class _FakeAzureKeyCredential:
 
 
 class _FakeDocumentIntelligenceClient:
-    """Mimics ``azure.ai.documentintelligence.DocumentIntelligenceClient`` for offline tests."""
+    """Mimics ``azure.ai.documentintelligence.DocumentIntelligenceClient`` for offline tests.
+
+    The real SDK client is a context manager that owns a long-lived HTTP transport; mirroring
+    ``__enter__``/``__exit__``/``close`` here lets tests assert the adapter releases it.
+    """
 
     def __init__(self, *, endpoint: str, credential: object) -> None:
         self.endpoint = endpoint
         self.credential = credential
+        self.closed = False
 
     def begin_analyze_document(self, model_id: str, *, body: object) -> _FakePoller:
         # The adapter must pass the model id positionally and the file handle via ``body=``.
         assert model_id == "prebuilt-read"
         assert hasattr(body, "read")
         return _FakePoller(_FAKE_CONTENT)
+
+    def close(self) -> None:
+        self.closed = True
+
+    def __enter__(self) -> _FakeDocumentIntelligenceClient:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
 
 def _install_fake_azure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -141,6 +155,55 @@ def test_parse_round_trips_into_parsed_doc(fake_docintel: None, tmp_path: Path) 
     assert kinds == ["heading", "text", "text"]
     assert texts == ["# Title", "Alpha beta gamma.", "Delta epsilon zeta."]
     assert orders == [0, 1, 2]
+
+
+def test_parse_closes_client_releasing_transport(
+    fake_docintel: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Regression: the client owns a long-lived HTTP transport and must be closed per parse,
+    # otherwise a corpus of N files leaks N pooled connections / sockets.
+    created: list[_FakeDocumentIntelligenceClient] = []
+
+    class _TrackingClient(_FakeDocumentIntelligenceClient):
+        def __init__(self, *, endpoint: str, credential: object) -> None:
+            super().__init__(endpoint=endpoint, credential=credential)
+            created.append(self)
+
+    docintel_mod = sys.modules["azure.ai.documentintelligence"]
+    docintel_mod.DocumentIntelligenceClient = _TrackingClient  # type: ignore[attr-defined]
+
+    src = tmp_path / "doc.pdf"
+    src.write_bytes(b"x")
+    DocumentIntelligenceParser().parse(src)
+
+    assert len(created) == 1
+    assert created[0].closed is True
+
+
+def test_parse_closes_client_on_vendor_failure(
+    fake_docintel: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Even when analyze raises, the context manager must still release the transport.
+    created: list[_FakeDocumentIntelligenceClient] = []
+
+    class _BoomTrackingClient(_FakeDocumentIntelligenceClient):
+        def __init__(self, *, endpoint: str, credential: object) -> None:
+            super().__init__(endpoint=endpoint, credential=credential)
+            created.append(self)
+
+        def begin_analyze_document(self, model_id: str, *, body: object) -> _FakePoller:
+            raise RuntimeError("vendor blew up")
+
+    docintel_mod = sys.modules["azure.ai.documentintelligence"]
+    docintel_mod.DocumentIntelligenceClient = _BoomTrackingClient  # type: ignore[attr-defined]
+
+    src = tmp_path / "doc.pdf"
+    src.write_bytes(b"x")
+    with pytest.raises(StageError):
+        DocumentIntelligenceParser().parse(src)
+
+    assert len(created) == 1
+    assert created[0].closed is True
 
 
 def test_reads_endpoint_and_key_from_env(

@@ -197,8 +197,14 @@ class AzureOpenAILLM:
         (mirrors :meth:`OpenAILLM._is_reasoning_model`). Azure deployment names are operator
         chosen but conventionally contain the model id (e.g. ``gpt-5-mini``, ``o3-prod``); when
         the guess is wrong, :meth:`_create_resilient` corrects it from the API's 400 response.
+
+        The ``gpt-5-chat*`` variants are ordinary chat models (they accept custom
+        ``temperature`` and reject ``reasoning_effort``), so a deployment naming one is carved
+        out before the gpt-5 reasoning match.
         """
         name = deployment.lower()
+        if "gpt-5-chat" in name:
+            return False
         return name.startswith(("gpt-5", "o1", "o3", "o4")) or "gpt-5" in name
 
 
@@ -212,7 +218,12 @@ def _unsupported_param(exc: Exception) -> str | None:
     if type(exc).__name__ != "BadRequestError" and getattr(exc, "status_code", None) != 400:
         return None
     msg = str(getattr(exc, "message", None) or exc).lower()
-    if "support" not in msg:
+    # Different APIs/versions phrase an unsupported parameter differently — "does not support",
+    # "unsupported", "unrecognized request argument supplied", "unknown parameter", "is not
+    # supported" — so match the parameter name together with any of these signal phrases rather
+    # than relying on the single substring "support".
+    signals = ("support", "unsupported", "unrecognized", "unknown parameter", "not supported")
+    if not any(token in msg for token in signals):
         return None
     if "temperature" in msg:
         return "temperature"

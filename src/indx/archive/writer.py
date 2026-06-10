@@ -8,8 +8,11 @@ double-run Docker test relies on (testing-strategy §4.4g).
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import zipfile
 from collections.abc import Iterable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -41,11 +44,22 @@ def write_archive(space: KnowledgeSpace, dest: Path) -> None:
         *content,
         (fmt.CHECKSUMS, json.dumps(checksums, indent=2, sort_keys=True) + "\n"),
     ]
-    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for name, data in members:  # deterministic member order
-            info = zipfile.ZipInfo(name, date_time=_FIXED_DATE)
-            info.compress_type = zipfile.ZIP_DEFLATED
-            zf.writestr(info, data)
+    # Write to a temp file in the same directory, then atomically rename it into place so an
+    # I/O error mid-write (e.g. ENOSPC during compression/flush) never truncates dest or
+    # destroys a previously valid archive at this path (mirrors utils/cache.py:put).
+    fd, tmp = tempfile.mkstemp(dir=dest.parent, suffix=".tmp")
+    try:
+        os.close(fd)
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for name, data in members:  # deterministic member order
+                info = zipfile.ZipInfo(name, date_time=_FIXED_DATE)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                zf.writestr(info, data)
+        os.replace(tmp, dest)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def _jsonl(rows: Iterable[dict[str, Any]]) -> str:

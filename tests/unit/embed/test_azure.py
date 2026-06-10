@@ -21,8 +21,9 @@ if TYPE_CHECKING:
 
 
 class _FakeEmbedding:
-    def __init__(self, embedding: list[float]) -> None:
+    def __init__(self, embedding: list[float], index: int = 0) -> None:
         self.embedding = embedding
+        self.index = index
 
 
 class _FakeResponse:
@@ -39,7 +40,7 @@ class _FakeEmbeddings:
     def create(self, *, model: str, input: Sequence[str], **kwargs: Any) -> _FakeResponse:
         self._client.calls.append({"model": model, "input": list(input), **kwargs})
         width = kwargs.get("dimensions", AzureOpenAIEmbedder.dim)
-        data = [_FakeEmbedding([float(len(text))] * width) for text in input]
+        data = [_FakeEmbedding([float(len(text))] * width, index=i) for i, text in enumerate(input)]
         return _FakeResponse(data)
 
 

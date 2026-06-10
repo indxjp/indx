@@ -13,6 +13,16 @@ name**, not the ``indx.toml`` section heading, so the LLM slot (configured under
 
 A missing explicit config path or malformed/invalid TOML raises
 :class:`~indx.errors.ConfigError` (CLI exit code 3).
+
+.. note::
+
+    The TOML and env precedence layers are *value-compatible* but **not type-equivalent**
+    for adapter passthrough options. TOML scalars are parsed natively by ``tomllib``
+    (``port = 6333`` -> ``int``, ``use_tls = true`` -> ``bool``), whereas env vars are
+    opaque passthrough (``extra="allow"`` with no typed schema, see :class:`_SlotEnv`) and
+    therefore always arrive as **strings** (``INDX_STORE__PORT=6333`` -> ``"6333"``). Env
+    passthrough is forwarded verbatim, so adapters that accept non-string options must coerce
+    their own kwargs rather than assume the TOML-parsed Python type.
 """
 
 from __future__ import annotations
@@ -136,15 +146,27 @@ def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]
 
 
 def _slot_backend(
-    slot: str, selector: str, env_section: dict[str, Any], raw: dict[str, Any]
+    slot: str,
+    selector: str,
+    env_section: dict[str, Any],
+    raw: dict[str, Any],
+    overrides: dict[str, str | None] | None = None,
 ) -> str:
-    """Resolve the backend a slot's env passthrough belongs to (``env > toml > default``).
+    """Resolve the backend a slot's env passthrough belongs to.
+
+    Precedence is ``CLI override > env > toml > default``. CLI overrides (and the
+    ``--aws/--azure/--gcp`` presets folded into them) are the highest-precedence layer and
+    are what actually select the effective backend, so the env passthrough must be filed
+    under *their* backend — otherwise the namespacing and the final selector fall out of
+    sync and ``slot_options()`` reads an empty sub-table.
 
     The selector value is ``backend[:model]`` (e.g. ``openai:gpt-5-mini``); only the
-    backend prefix names the sub-table. Precedence mirrors the overall env-over-file merge
-    so passthrough lands under the same backend the resolved selector will pick.
+    backend prefix names the sub-table.
     """
     section, _ = _SLOT_TO_SECTION[slot]
+    override_value = (overrides or {}).get(slot)
+    if isinstance(override_value, str):
+        return override_value.split(":", 1)[0]
     value = env_section.get(selector)
     if not isinstance(value, str):
         raw_section = raw.get(section)
@@ -153,7 +175,9 @@ def _slot_backend(
     return value.split(":", 1)[0]
 
 
-def _env_layer(raw: dict[str, Any]) -> dict[str, Any]:
+def _env_layer(
+    raw: dict[str, Any], overrides: dict[str, str | None] | None = None
+) -> dict[str, Any]:
     """Translate ``INDX_<SLOT>__*`` env vars into a partial Config-shaped dict.
 
     Each slot's selector env var (``INDX_PARSER__ENGINE``, ``INDX_STORE__BACKEND``, ...)
@@ -161,11 +185,23 @@ def _env_layer(raw: dict[str, Any]) -> dict[str, Any]:
     passthrough adapter options on the matching section. Sections hosting multiple adapter
     slots (``enrich`` carries both ``llm`` and ``vlm``) namespace their passthrough under a
     ``[<section>.<backend>]`` sub-table — mirroring the TOML shape — so the two slots' keys
-    cannot collide and never cross-leak. ``raw`` (the parsed TOML) is consulted only to
-    resolve each slot's effective backend for that namespacing.
+    cannot collide and never cross-leak. ``raw`` (the parsed TOML) and ``overrides`` (the
+    CLI/preset layer) are consulted only to resolve each slot's effective backend for that
+    namespacing, so the passthrough lands under the backend the final selector will pick.
+
+    Per-backend namespacing keeps the two ``enrich`` slots apart only while they resolve to
+    *different* backends. When ``llm`` and ``vlm`` resolve to the **same** backend (e.g. both
+    on Azure OpenAI) their distinct ``INDX_LLM__*`` / ``INDX_VLM__*`` passthrough would land
+    in one shared ``[enrich.<backend>]`` sub-table that ``Config.slot_options()`` then hands
+    to *both* adapters — silently routing one slot's secret/endpoint to the other and losing
+    the other slot's. That is undetectable downstream and a config-integrity hazard, so it is
+    rejected here with an actionable :class:`ConfigError` rather than resolved arbitrarily.
     """
     env = _EnvSettings()
     layer: dict[str, Any] = {}
+    # backend -> set of NAMESPACED slots that contributed passthrough to it, used to detect
+    # two distinct enrich slots sharing one [enrich.<backend>] sub-table (see below).
+    namespaced_backends: dict[str, set[str]] = {}
     for slot, (section, selector) in _SLOT_TO_SECTION.items():
         values = getattr(env, slot).model_dump()
         if not values:
@@ -175,7 +211,7 @@ def _env_layer(raw: dict[str, Any]) -> dict[str, Any]:
         # sub-table so INDX_LLM__* and INDX_VLM__* reach the right adapter independently.
         passthrough_dict = section_dict
         if slot in _NAMESPACED_SLOTS:
-            backend = _slot_backend(slot, selector, values, raw)
+            backend = _slot_backend(slot, selector, values, raw, overrides)
             passthrough_dict = section_dict.setdefault(backend, {})
         for key, value in values.items():
             if key == selector:
@@ -184,7 +220,35 @@ def _env_layer(raw: dict[str, Any]) -> dict[str, Any]:
                 section_dict[selector] = value
             else:
                 passthrough_dict[key] = value
+        if slot in _NAMESPACED_SLOTS and len(values) > (1 if selector in values else 0):
+            # This namespaced slot supplied at least one passthrough key. Record it so a
+            # second slot resolving to the same backend can be caught.
+            namespaced_backends.setdefault(backend, set()).add(slot)
+    _reject_shared_enrich_backend(namespaced_backends)
     return layer
+
+
+def _reject_shared_enrich_backend(namespaced_backends: dict[str, set[str]]) -> None:
+    """Reject two distinct ``enrich`` slots whose env passthrough lands on one backend.
+
+    The ``[enrich.<backend>]`` sub-table is shared by ``llm`` and ``vlm`` whenever they
+    resolve to the same backend, so their separate ``INDX_LLM__*`` / ``INDX_VLM__*``
+    passthrough collapses into one dict that :meth:`Config.slot_options` then hands to *both*
+    adapters — silently clobbering one slot's secret/endpoint and cross-leaking it to the
+    other. Per-slot env namespacing cannot disambiguate this, so it is raised as an
+    actionable :class:`ConfigError` instead of resolved arbitrarily. (A single slot's
+    passthrough, or two slots on different backends, is unaffected.)
+    """
+    for backend, slots in namespaced_backends.items():
+        if len(slots) > 1:
+            joined = "/".join(f"INDX_{s.upper()}__*" for s in sorted(slots))
+            raise ConfigError(
+                f"the enrich slots {sorted(slots)} both resolve to backend '{backend}', "
+                f"so their {joined} passthrough env vars would share the single "
+                f"[enrich.{backend}] sub-table and be mis-routed to both adapters. Put each "
+                f"slot's options in indx.toml under a distinct selector, or run the llm and "
+                f"vlm slots on different backends."
+            )
 
 
 def load_config(
@@ -208,7 +272,9 @@ def load_config(
             raise ConfigError(f"could not read {config_path}: {exc}") from exc
 
     # Layer env vars above the file (below CLI). Defaults are supplied by the model itself.
-    merged = _deep_merge(raw, _env_layer(raw))
+    # CLI overrides are threaded in so dual-slot env passthrough (enrich.llm/vlm) is
+    # namespaced under the backend the overrides will finalize, not the env/toml default.
+    merged = _deep_merge(raw, _env_layer(raw, overrides))
 
     try:
         config = Config.model_validate(merged)

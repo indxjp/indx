@@ -162,6 +162,41 @@ def test_create_retries_when_deployment_rejects_temperature(
     assert call["max_completion_tokens"] == 64
 
 
+def test_create_recovers_from_unrecognized_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deployment mis-guessed as reasoning that 400s on ``reasoning_effort`` recovers.
+
+    The 400 wording — "Unrecognized request argument supplied: reasoning_effort" — contains
+    "unrecognized"/"supplied" but not "support"; the adapter must still recognise it, drop
+    ``reasoning_effort``, swap in ``temperature`` and retry to success.
+    """
+    _install_fake_openai(monkeypatch)
+    # A gpt-5 name → first attempt sends reasoning_effort (no temperature).
+    adapter = AzureOpenAILLM(
+        model="gpt-5-prod",
+        api_key="k",
+        azure_endpoint="https://e.openai.azure.com",
+        api_version="2024-10-21",
+    )
+    client = adapter._ensure_client()
+    real_create = client.chat.completions.create
+
+    def flaky_create(**kwargs: Any) -> Any:
+        if "reasoning_effort" in kwargs:
+            raise _FakeBadRequest("Unrecognized request argument supplied: reasoning_effort")
+        return real_create(**kwargs)
+
+    monkeypatch.setattr(client.chat.completions, "create", flaky_create)
+
+    out = adapter.complete("hi", max_tokens=64, temperature=0.0)
+    assert out == "fake-azure-response"
+    (call,) = client.calls
+    assert "reasoning_effort" not in call
+    assert call["temperature"] == 0.0
+    assert call["max_completion_tokens"] == 64
+
+
 def test_reasoning_deployment_omits_temperature(monkeypatch: pytest.MonkeyPatch) -> None:
     """A gpt-5/o-series deployment must omit ``temperature`` (the model rejects a custom one)."""
     _install_fake_openai(monkeypatch)
@@ -176,6 +211,28 @@ def test_reasoning_deployment_omits_temperature(monkeypatch: pytest.MonkeyPatch)
     assert call["max_completion_tokens"] == 16
     assert "max_tokens" not in call
     assert "temperature" not in call  # omitted for reasoning models
+
+
+@pytest.mark.parametrize("deployment", ["gpt-5-chat", "gpt-5-chat-latest-prod"])
+def test_gpt5_chat_deployment_forwards_temperature(
+    monkeypatch: pytest.MonkeyPatch, deployment: str
+) -> None:
+    """A gpt-5-chat* deployment is a non-reasoning model: keep ``temperature``, no effort knob."""
+    assert AzureOpenAILLM._is_reasoning_model(deployment) is False
+
+    _install_fake_openai(monkeypatch)
+    adapter = AzureOpenAILLM(
+        model=deployment,
+        api_key="k",
+        azure_endpoint="https://e.openai.azure.com",
+        api_version="2024-10-21",
+    )
+    adapter.complete("hi", max_tokens=16, temperature=0.3)
+    (call,) = adapter._ensure_client().calls  # type: ignore[attr-defined]
+    assert call["max_completion_tokens"] == 16
+    assert call["temperature"] == 0.3
+    assert "reasoning_effort" not in call
+    assert "max_tokens" not in call
 
 
 def test_complete_without_system_omits_system_message(

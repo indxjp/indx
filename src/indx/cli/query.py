@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from rich.markup import escape
 from rich.table import Table
 
 from indx.cli._render import console, load_space
@@ -51,11 +52,11 @@ def query_command(
         console.print_json(json.dumps(payload))
         return
 
-    table = Table(title=f"query: {text!r}")
+    table = Table(title=f"query: {escape(repr(text))}")
     table.add_column("score", justify="right")
     table.add_column("source")
     table.add_column("text")
     for hit, _doc, source in rows:
         snippet = hit.chunk.text[:80].replace("\n", " ")
-        table.add_row(f"{hit.score:.3f}", source, snippet)
+        table.add_row(f"{hit.score:.3f}", escape(source), escape(snippet))
     console.print(table)

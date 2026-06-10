@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from pathlib import Path
 
+from rich.markup import escape
 from rich.table import Table
 
 from indx.cli._render import console, load_space
@@ -24,7 +25,7 @@ def inspect_command(
 
     if documents is not None:
         wanted = documents if documents not in ("", "all") else None
-        table = Table(title="Documents" + (f" (type={wanted})" if wanted else ""))
+        table = Table(title="Documents" + (f" (type={escape(wanted)})" if wanted else ""))
         table.add_column("id")
         table.add_column("type")
         table.add_column("path")
@@ -32,17 +33,26 @@ def inspect_command(
         for d in space.documents_:
             if wanted and (d.doc_type or "unknown") != wanted:
                 continue
-            table.add_row(d.id, d.doc_type or "·", d.path, str(len(space.chunks_for(d.id))))
+            table.add_row(
+                escape(d.id),
+                escape(d.doc_type or "·"),
+                escape(d.path),
+                str(len(space.chunks_for(d.id))),
+            )
         console.print(table)
         return
 
     m = space.manifest
     stats = space.stats  # documented SpaceStats surface (inspect-and-query.mdx)
-    console.print(f"[bold]{space_path}[/bold]  schema={m.schema_version} indx={m.indx_version}")
+    console.print(
+        f"[bold]{escape(str(space_path))}[/bold]  "
+        f"schema={escape(m.schema_version)} indx={escape(m.indx_version)}"
+    )
     console.print(
         f"  documents={stats.documents} chunks={stats.chunks} "
         f"relations={stats.relations} embeddings={stats.embeddings} "
-        f"embedding={m.embedding_model}/{stats.embed_dim} bytes_source={stats.bytes_source}"
+        f"embedding={escape(m.embedding_model or '')}/{stats.embed_dim} "
+        f"bytes_source={stats.bytes_source}"
     )
 
     if stats.types:
@@ -50,7 +60,7 @@ def inspect_command(
         type_table.add_column("type")
         type_table.add_column("count", justify="right")
         for dtype, count in sorted(stats.types.items()):
-            type_table.add_row(dtype, str(count))
+            type_table.add_row(escape(dtype), str(count))
         console.print(type_table)
 
     rel_counts = Counter(r.type.value for r in space.relations)
@@ -59,7 +69,7 @@ def inspect_command(
         rel_table.add_column("type")
         rel_table.add_column("count", justify="right")
         for rtype, count in sorted(rel_counts.items()):
-            rel_table.add_row(rtype, str(count))
+            rel_table.add_row(escape(rtype), str(count))
         console.print(rel_table)
 
     tree = Table(title="Documents")
@@ -68,8 +78,8 @@ def inspect_command(
     tree.add_column("topics")
     for d in space.documents_[:50]:
         tree.add_row(
-            "/".join([*d.lineage, Path(d.path).name]),
-            "/".join(d.lineage) or "·",
-            ", ".join(d.topics[:3]),
+            escape("/".join([*d.lineage, Path(d.path).name])),
+            escape("/".join(d.lineage) or "·"),
+            escape(", ".join(d.topics[:3])),
         )
     console.print(tree)

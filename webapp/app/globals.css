@@ -2,8 +2,22 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Semantic color tokens (referenced by tailwind.config.ts as `ink`/`panel`/`surface`). They
+   are CSS variables so a single `.dark` block re-themes every `text-ink` / `bg-panel` /
+   `bg-surface` consumer at once. The migrated journey tree never got per-class dark variants,
+   so driving the tokens here is what makes dark mode actually flip the cards and headings. */
 :root {
   color-scheme: light;
+  --color-ink: #0f172a; /* primary text — near-black on light */
+  --color-panel: #ffffff; /* card / panel surface */
+  --color-surface: #f1f5f9; /* page background (slate-100) */
+}
+
+.dark {
+  color-scheme: dark;
+  --color-ink: #e2e8f0; /* primary text — slate-200 on dark */
+  --color-panel: #0f172a; /* card / panel surface — slate-900 */
+  --color-surface: #020617; /* page background — slate-950 */
 }
 
 html,
@@ -25,9 +39,10 @@ body {
   }
 
   .field {
-    @apply w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm
+    /* `text-ink` is explicit so the input value stays legible after the bg flips dark. */
+    @apply w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-ink
       shadow-sm outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/30
-      disabled:cursor-not-allowed disabled:bg-slate-100;
+      disabled:cursor-not-allowed disabled:bg-slate-100 dark:disabled:bg-slate-950;
   }
 
   .btn {
@@ -47,4 +62,47 @@ body {
   .badge {
     @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium;
   }
+}
+
+/* Dark-mode fallbacks for the raw Tailwind palette utilities the journey components use
+   directly (bg-white / bg-slate-50·100 / border-slate-* / text-slate-600·700·800 / hover
+   states). The views were authored light-only with these literal utilities; rather than
+   annotate 100+ call-sites with `dark:` variants, we remap the neutral ones centrally. Colored
+   utilities (rose/emerald/sky/amber banners, accent) are intentionally left untouched. These
+   rules sit after `@tailwind utilities`, so on equal specificity they win the source-order tie. */
+.dark .bg-white {
+  background-color: theme('colors.slate.900');
+}
+.dark .bg-white\/50 {
+  background-color: theme('colors.slate.900');
+}
+.dark .bg-slate-50 {
+  background-color: theme('colors.slate.800');
+}
+.dark .bg-slate-100 {
+  background-color: theme('colors.slate.800');
+}
+.dark .border-slate-100 {
+  border-color: theme('colors.slate.800');
+}
+.dark .border-slate-200 {
+  border-color: theme('colors.slate.800');
+}
+.dark .border-slate-300 {
+  border-color: theme('colors.slate.700');
+}
+.dark .text-slate-600 {
+  color: theme('colors.slate.400');
+}
+.dark .text-slate-700 {
+  color: theme('colors.slate.300');
+}
+.dark .text-slate-800 {
+  color: theme('colors.slate.200');
+}
+.dark .hover\:bg-slate-50:hover {
+  background-color: theme('colors.slate.800');
+}
+.dark .hover\:bg-slate-100:hover {
+  background-color: theme('colors.slate.800');
 }

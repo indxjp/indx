@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from indx.pipeline import BuildPlan, DirectoryPipeline
+from indx.utils import zip_input as zip_input_mod
 from indx.utils.zip_input import ZipInputError, extract_zip, is_zip_input
 
 OFFLINE = {"parser": "plaintext", "llm": "none", "embedder": "hash", "store": "jsonl"}
@@ -76,6 +77,21 @@ def test_zip_slip_member_is_rejected(tmp_path: Path) -> None:
     before = set(_live_temp_dirs())
     with pytest.raises(ZipInputError, match="zip-slip"):
         extract_zip(evil)
+    assert set(_live_temp_dirs()) == before  # the partial extraction dir is removed on failure
+
+
+def test_zip_bomb_oversized_expansion_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A tiny, highly-compressible archive whose uncompressed size dwarfs a low cap. With a small
+    # cap we can prove the budget guard fires without writing GBs to disk.
+    monkeypatch.setattr(zip_input_mod, "_MAX_TOTAL_BYTES", 64 * 1024)
+    bomb = tmp_path / "bomb.zip"
+    with zipfile.ZipFile(bomb, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("big.txt", b"\0" * (1024 * 1024))  # 1 MiB uncompressed, kilobytes on disk
+    before = set(_live_temp_dirs())
+    with pytest.raises(ZipInputError, match="oversized"):
+        extract_zip(bomb)
     assert set(_live_temp_dirs()) == before  # the partial extraction dir is removed on failure
 
 

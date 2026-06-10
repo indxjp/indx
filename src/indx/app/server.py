@@ -42,14 +42,25 @@ document.getElementById('s').innerHTML='<span class="ok">ok</span> · indx '+d.v
 
 def create_app() -> FastAPI:
     """Build the FastAPI app: ``/api`` router plus the SPA catch-all when bundled."""
+    from contextlib import asynccontextmanager
+
     from fastapi import FastAPI
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
 
     from indx import __version__
-    from indx.app.api import build_router
+    from indx.app.api import _cleanup_app_temp_dirs, build_router
 
-    app = FastAPI(title="indx app", version=__version__)
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):  # type: ignore[no-untyped-def]
+        # Remove the app-owned temp dirs (build outputs, demo spaces, import work dir) on
+        # shutdown. The ASGI lifespan fires reliably under uvicorn's signal handling, whereas a
+        # bare ``atexit`` hook does not (uvicorn's SIGTERM path can skip interpreter atexit) — so
+        # this, not the atexit fallback in api.py, is what actually cleans up on a normal Ctrl-C.
+        yield
+        _cleanup_app_temp_dirs()
+
+    app = FastAPI(title="indx app", version=__version__, lifespan=lifespan)
     app.include_router(build_router(), prefix="/api")
 
     # Mount the exported Next.js SPA at '/' only when the bundle is present (index.html). In a
@@ -79,7 +90,7 @@ def create_app() -> FastAPI:
             def spa(full_path: str) -> JSONResponse | FileResponse:
                 # Never shadow the API; anything else falls back to the SPA entrypoint so
                 # client-side routing works (output:'export' single-page catch-all).
-                if full_path.startswith("api"):
+                if full_path == "api" or full_path.startswith("api/"):
                     return JSONResponse({"detail": "Not Found"}, status_code=404)
                 if full_path:
                     candidate = (root / full_path).resolve()

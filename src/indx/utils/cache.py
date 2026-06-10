@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -81,4 +84,15 @@ class StageCache:
         path = self._path(stage, input_hash, component_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         # sort_keys keeps the on-disk form byte-stable for identical inputs (NFR-DET-1).
-        path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        data = json.dumps(payload, sort_keys=True)
+        # Write to a temp file in the same directory, then atomically rename it into place so
+        # concurrent writers (--resume --jobs>1) or an interrupted run never expose a torn file.
+        fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(data)
+            os.replace(tmp, path)
+        except BaseException:
+            with suppress(OSError):
+                os.unlink(tmp)
+            raise

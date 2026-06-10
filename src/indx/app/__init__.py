@@ -1,4 +1,4 @@
-"""``indx app`` — a local FastAPI web tester for INDX (docs/app-spec.md).
+"""``indx app`` — INDX, the local FastAPI server for the journey UI (docs/app-spec.md).
 
 This package is shipped as the optional ``indx[app]`` extra. ``fastapi`` / ``uvicorn`` /
 ``starlette`` are imported **lazily inside functions** (never at module top), exactly like

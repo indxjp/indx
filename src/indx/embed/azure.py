@@ -13,6 +13,7 @@ import logging
 import os
 from typing import TYPE_CHECKING
 
+from indx.embed._batch import MAX_TOKENS_PER_REQUEST, embed_in_batches
 from indx.errors import StageError
 from indx.utils.lazy import require_extra
 
@@ -70,6 +71,8 @@ class AzureOpenAIEmbedder:
         api_version: str | None = None,
         deployment: str | None = None,
         dimensions: int | None = None,
+        batch_size: int = 256,
+        max_tokens_per_request: int = MAX_TOKENS_PER_REQUEST,
     ) -> None:
         """Configure the Azure OpenAI embedder.
 
@@ -84,6 +87,9 @@ class AzureOpenAIEmbedder:
             dimensions: Optional output-dimension override (3-small/3-large support truncation when
                 ``api_version`` is at least ``2024-10-21``). When omitted, ``dim`` is inferred from
                 the deployment name.
+            batch_size: Maximum number of texts sent per ``embeddings.create`` request.
+            max_tokens_per_request: Token ceiling per request. Batches are sub-split to stay under
+                it so dense (e.g. CJK) text does not overflow Azure OpenAI's 300k-token cap.
 
         Raises:
             MissingExtraError: If the ``azure`` extra is not installed.
@@ -98,6 +104,8 @@ class AzureOpenAIEmbedder:
             api_version or os.environ.get("AZURE_OPENAI_API_VERSION") or _DEFAULT_API_VERSION
         )
         self._dimensions = dimensions
+        self._batch_size = batch_size
+        self._max_tokens_per_request = max_tokens_per_request
         # Record the *actual* deployment in the manifest; reflect its real width.
         self.name = self._deployment or _NAME
         inferred = _infer_dim(self._deployment) if self._deployment else _DEFAULT_DIM
@@ -162,12 +170,25 @@ class AzureOpenAIEmbedder:
         if not texts:
             return []
         client = self._ensure_client()
-        kwargs: dict[str, object] = {"model": self._deployment, "input": texts}
-        if self._dimensions is not None:
-            kwargs["dimensions"] = self._dimensions
-        try:
+
+        def call(batch: list[str]) -> list[list[float]]:
+            kwargs: dict[str, object] = {"model": self._deployment, "input": batch}
+            if self._dimensions is not None:
+                kwargs["dimensions"] = self._dimensions
             response = client.embeddings.create(**kwargs)
+            # The API echoes each item's input index; sort to guarantee input order, then convert
+            # the vendor response → core vectors AT THE EDGE. No openai/float type leaks upward.
+            return [
+                [float(v) for v in item.embedding]
+                for item in sorted(response.data, key=lambda d: d.index)
+            ]
+
+        try:
+            return embed_in_batches(
+                texts,
+                max_items=self._batch_size,
+                max_tokens=self._max_tokens_per_request,
+                call=call,
+            )
         except Exception as exc:  # normalize backend errors to a typed IndxError
             raise StageError("embed", str(exc)) from exc
-        # Convert the vendor response → core vectors AT THE EDGE. No openai/float type leaks upward.
-        return [[float(v) for v in item.embedding] for item in response.data]

@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from indx.errors import MissingExtraError
+from indx.errors import MissingExtraError, StageError
 from indx.vlm.base import VLM
 
 
@@ -129,6 +129,63 @@ def test_describe_handles_empty_content(
 
     monkeypatch.setattr(_FakeOpenAI, "reply", None)
     assert GPT4oVLM().describe(b"x") == ""
+
+
+@pytest.mark.parametrize(
+    ("image", "expected_mime"),
+    [
+        (b"\x89PNG\r\n\x1a\n\x00\x00", "image/png"),
+        (b"\xff\xd8\xff\xe0\x00\x10JFIF", "image/jpeg"),
+        (b"GIF89a\x01\x00", "image/gif"),
+        (b"RIFF\x00\x00\x00\x00WEBPVP8 ", "image/webp"),
+        (b"unknown-bytes", "image/png"),  # fallback
+    ],
+)
+def test_describe_sniffs_image_mime_from_magic_bytes(
+    fake_openai: type[_FakeOpenAI], image: bytes, expected_mime: str
+) -> None:
+    """The data: URL MIME must match the real image bytes, not a hard-coded image/png.
+
+    OpenAI validates the declared content-type against the payload, so a JPEG/GIF/WebP
+    figure sent with image/png would be rejected.
+    """
+    from indx.vlm.gpt4o import GPT4oVLM
+
+    vlm = GPT4oVLM()
+    vlm.describe(image)
+
+    content = vlm._ensure_client().last_kwargs["messages"][0]["content"]
+    image_part = next(p for p in content if p["type"] == "image_url")
+    assert image_part["image_url"]["url"].startswith(f"data:{expected_mime};base64,")
+
+
+def test_vendor_exception_becomes_stage_error(fake_openai: type[_FakeOpenAI]) -> None:
+    """A raw vendor error (network/rate-limit/auth) must surface as StageError."""
+    from indx.vlm.gpt4o import GPT4oVLM
+
+    vlm = GPT4oVLM()
+
+    def _boom(**_kwargs: Any) -> None:
+        raise RuntimeError("rate limit exceeded")
+
+    vlm._ensure_client().chat.completions.create = _boom  # type: ignore[method-assign]
+    with pytest.raises(StageError):
+        vlm.describe(b"img")
+
+
+def test_describe_handles_empty_choices(fake_openai: type[_FakeOpenAI]) -> None:
+    """An empty choices list (content-filtered) returns '' rather than raising IndexError."""
+    from indx.vlm.gpt4o import GPT4oVLM
+
+    vlm = GPT4oVLM()
+
+    class _EmptyCompletion:
+        choices: list[Any] = []
+
+    vlm._ensure_client().chat.completions.create = (  # type: ignore[method-assign]
+        lambda **_k: _EmptyCompletion()
+    )
+    assert vlm.describe(b"img") == ""
 
 
 def test_construction_without_extra_raises_missing_extra() -> None:

@@ -13,6 +13,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # The `indx app` UI is a Next.js static export that is gitignored (only a `.gitkeep`
+      # is tracked under src/indx/app/static/). It must be built here, BEFORE `python -m
+      # build`, or the published wheel ships `indx app` with no bundle. hatch's `artifacts`
+      # allowlist (pyproject.toml) then carries src/indx/app/static/** into the wheel.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build the Next.js UI bundle into src/indx/app/static/
+        run: bash scripts/build_webapp.sh
       - run: pip install build
       - run: python -m build
       # Release gates on the packaged artifact, not the source tree (testing-strategy §5):
@@ -24,6 +33,16 @@ jobs:
           /tmp/relenv/bin/indx --version
           /tmp/relenv/bin/indx tests/corpus/airgap_smoke --out /tmp/relout \
             --parser plaintext --embedder hash --store jsonl --format jsonl --llm none
+          # Assert the Next.js UI bundle actually shipped in the wheel (not just the
+          # .gitkeep placeholder), so a missing build step fails the release loudly.
+          /tmp/relenv/bin/python - <<'PY'
+          import pathlib, indx.app
+          static = pathlib.Path(indx.app.__file__).parent / "static"
+          idx = static / "index.html"
+          assert (static / "_next").is_dir(), f"_next/ assets missing from wheel: {static}"
+          assert idx.stat().st_size > 500, f"index.html looks like a stub ({idx.stat().st_size}B)"
+          print("OK: indx app UI bundle present in wheel")
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: dist
@@ -32,6 +51,10 @@ jobs:
   publish:
     name: publish to PyPI
     needs: build
+    # Only the public repo publishes. This file is mirrored verbatim into indxjp/indx
+    # by release-pr.yml, so the guard lets the same workflow build (smoke-test) on an
+    # indx-meta tag while publishing only from indxjp/indx.
+    if: github.repository == 'indxjp/indx'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

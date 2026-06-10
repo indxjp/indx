@@ -130,13 +130,17 @@ class DocumentIntelligenceParser:
         Raises:
             StageError: If the endpoint/key is missing or the analyze call fails.
         """
+        # Build the client BEFORE the try so its clean StageError (missing endpoint/key) is
+        # not re-wrapped into the generic ``docintel failed: ...`` message below.
         client = self._client()
         try:
             # SDK 1.0.0 takes the model id positionally and the local bytes via ``body=``
             # (NOT the older ``analyze_request=AnalyzeDocumentRequest(...)`` from the betas).
-            with open(path, "rb") as f:
+            # The client is a context manager: closing it per-parse releases the long-lived
+            # HTTP transport / connection pool so a corpus of N files doesn't leak N sockets.
+            with client, open(path, "rb") as f:
                 poller = client.begin_analyze_document(self._model_id, body=f)
-            result = poller.result()
+                result = poller.result()
         except Exception as exc:  # vendor exception — translate at the edge
             raise StageError("parse", f"docintel failed: {exc}", path=str(path)) from exc
 

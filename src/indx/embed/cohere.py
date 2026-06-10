@@ -34,6 +34,9 @@ _MODEL_DIMS: dict[str, int] = {
 
 _DEFAULT_MODEL = "embed-english-v3.0"
 
+# The Cohere embed API caps a single request at 96 input texts; sub-batch above this.
+_COHERE_MAX_INPUTS = 96
+
 
 class CohereEmbedder:
     """Embedder backed by Cohere's hosted ``embed`` API.
@@ -107,16 +110,22 @@ class CohereEmbedder:
         """
         if not texts:
             return []
-        try:
-            response = self._client.embed(
-                texts=texts,
-                model=self.name,
-                input_type=self.input_type,
-            )
-        except Exception as exc:  # normalize vendor errors to a typed IndxError
-            raise StageError("embed", f"Cohere embed call failed: {exc}") from exc
+        # The Cohere embed API rejects requests above 96 inputs, so sub-batch the texts
+        # and concatenate the per-batch vectors in input order.
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), _COHERE_MAX_INPUTS):
+            batch = texts[start : start + _COHERE_MAX_INPUTS]
+            try:
+                response = self._client.embed(
+                    texts=batch,
+                    model=self.name,
+                    input_type=self.input_type,
+                )
+            except Exception as exc:  # normalize vendor errors to a typed IndxError
+                raise StageError("embed", f"Cohere embed call failed: {exc}") from exc
 
-        embeddings = getattr(response, "embeddings", None)
-        if embeddings is None:
-            raise StageError("embed", "Cohere response missing 'embeddings'.")
-        return [[float(value) for value in vector] for vector in embeddings]
+            embeddings = getattr(response, "embeddings", None)
+            if embeddings is None:
+                raise StageError("embed", "Cohere response missing 'embeddings'.")
+            vectors.extend([float(value) for value in vector] for vector in embeddings)
+        return vectors

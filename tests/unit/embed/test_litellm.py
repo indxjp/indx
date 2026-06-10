@@ -54,11 +54,48 @@ def test_embeds_one_vector_per_input(fake_litellm: types.ModuleType) -> None:
     assert fake_litellm.last_request["model"] == "bedrock/amazon.titan-embed-text-v2:0"
 
 
+def test_reorders_response_by_index(
+    fake_litellm: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # LiteLLM aggregates providers whose ``data`` is not guaranteed in input order. Encode the
+    # input position into each vector but hand the data back shuffled; the adapter must restore
+    # input order via the per-item ``index`` so vectors stay aligned with their source text.
+    def embedding(**kwargs: Any) -> _Response:
+        items = [
+            {"embedding": [float(i), 0.0, 0.0, 0.0], "index": i}
+            for i in range(len(kwargs["input"]))
+        ]
+        return _Response(list(reversed(items)))  # deliberately out of index order
+
+    monkeypatch.setattr(fake_litellm, "embedding", embedding)
+    vectors = LiteLLMEmbedder().embed(["a", "b", "c"])
+    assert [v[0] for v in vectors] == [0.0, 1.0, 2.0]  # realigned to input order
+
+
+def test_reorders_attribute_shaped_response_by_index(
+    fake_litellm: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Some providers return attribute objects rather than dicts; sorting must still use ``.index``.
+    class _Item:
+        def __init__(self, embedding: list[float], index: int) -> None:
+            self.embedding = embedding
+            self.index = index
+
+    def embedding(**kwargs: Any) -> _Response:
+        items = [_Item([float(i), 0.0, 0.0, 0.0], i) for i in range(len(kwargs["input"]))]
+        return _Response(list(reversed(items)))
+
+    monkeypatch.setattr(fake_litellm, "embedding", embedding)
+    vectors = LiteLLMEmbedder().embed(["a", "b", "c"])
+    assert [v[0] for v in vectors] == [0.0, 1.0, 2.0]
+
+
 def test_dimension_discovered_from_first_response(fake_litellm: types.ModuleType) -> None:
     emb = LiteLLMEmbedder()
-    assert emb.dim == 1536  # fallback before any call
+    # Reading dim probes the provider so the pipeline pre-sizes stores at the real width.
+    assert emb.dim == 4
     emb.embed(["hello"])
-    assert emb.dim == 4  # corrected to the real width
+    assert emb.dim == 4  # stays at the real width
 
 
 def test_pinned_dim_is_not_overwritten(fake_litellm: types.ModuleType) -> None:

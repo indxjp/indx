@@ -91,6 +91,18 @@ def test_batching_splits_into_multiple_requests(fake_openai: types.ModuleType) -
     assert [len(c["input"]) for c in calls] == [2, 2, 1]
 
 
+def test_token_budget_splits_dense_text_under_item_cap(fake_openai: types.ModuleType) -> None:
+    # Regression: dense (e.g. CJK) text overflowed OpenAI's 300k-token/request cap because
+    # batching was by item count only. With a tiny token budget, a high item cap still splits.
+    embedder = OpenAIEmbedder(batch_size=256, max_tokens_per_request=30)
+    texts = ["日本語のテスト文章" * 2, "もう一つの長い文章" * 2, "三つ目"]
+    vectors = embedder.embed(texts)
+
+    assert [v[0] for v in vectors] == [float(len(t)) for t in texts]  # order preserved
+    calls = embedder._client.embeddings.calls  # type: ignore[attr-defined]
+    assert len(calls) > 1  # split across multiple requests instead of one oversized one
+
+
 def test_name_records_actual_model(fake_openai: types.ModuleType) -> None:
     assert OpenAIEmbedder().name == "text-embedding-3-small"
     assert OpenAIEmbedder(model="text-embedding-3-large").name == "text-embedding-3-large"

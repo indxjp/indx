@@ -30,21 +30,33 @@ class ChunkStage:
 
 
 def _pack(text: str, max_chars: int) -> list[str]:
-    """Greedy paragraph packing up to ``max_chars``; structure-aware, deterministic."""
-    out: list[str] = []
+    """Greedy paragraph packing up to ``max_chars``; structure-aware, deterministic.
+
+    Any packed piece still longer than ``max_chars`` (e.g. a single paragraph
+    that exceeds the limit on its own) is hard-split on a deterministic
+    character window so ``max_chars`` is an upper bound, not a soft target.
+    """
+    packed: list[str] = []
     buf = ""
     for para in text.split("\n\n"):
         para = para.strip()
         if not para:
             continue
         if buf and len(buf) + len(para) + 2 > max_chars:
-            out.append(buf)
+            packed.append(buf)
             buf = para
         else:
             buf = f"{buf}\n\n{para}" if buf else para
     if buf:
-        out.append(buf)
-    return out or ([text.strip()] if text.strip() else [])
+        packed.append(buf)
+    packed = packed or ([text.strip()] if text.strip() else [])
+    out: list[str] = []
+    for piece in packed:
+        if len(piece) <= max_chars:
+            out.append(piece)
+        else:
+            out.extend(piece[i : i + max_chars] for i in range(0, len(piece), max_chars))
+    return out
 
 
 def _link(chunks: list[Chunk]) -> None:

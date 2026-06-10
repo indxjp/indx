@@ -16,7 +16,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from indx.errors import StageError
 from indx.utils.lazy import require_extra
+from indx.vlm.gpt4o import _sniff_mime
 
 if TYPE_CHECKING:
     from google.genai import (  # type: ignore[import-not-found]  # optional extra: gcp
@@ -101,22 +103,30 @@ class VertexVLM:
         """Describe an image using the Vertex Gemini multimodal model.
 
         Args:
-            image: Raw image bytes (PNG) to describe.
+            image: Raw image bytes (e.g. PNG/JPEG) to describe.
             prompt: Optional instruction guiding the description. Defaults to a generic
                 "describe this image" prompt.
 
         Returns:
             The model's description text, or an empty string if the model returned none.
+
+        Raises:
+            StageError: If the underlying Vertex AI call fails (wrapped at the edge).
         """
         from google.genai import types  # optional extra: gcp
 
         client = self._ensure_client()
-        resp = client.models.generate_content(
-            model=self.model,
-            contents=[
-                prompt or _DEFAULT_PROMPT,
-                types.Part.from_bytes(data=image, mime_type="image/png"),
-            ],
-        )
+        # Gemini decodes the inline part using the declared mime_type; sniff it from the
+        # magic bytes so JPEG/GIF/WebP figures (e.g. extracted from PDFs) are not mislabeled.
+        try:
+            resp = client.models.generate_content(
+                model=self.model,
+                contents=[
+                    prompt or _DEFAULT_PROMPT,
+                    types.Part.from_bytes(data=image, mime_type=_sniff_mime(image)),
+                ],
+            )
+        except Exception as exc:  # noqa: BLE001 — convert any vendor failure at the edge
+            raise StageError("enrich", f"{self.name} (vlm) failed: {exc}") from exc
         # Convert vendor response -> core str AT THE EDGE.
         return resp.text or ""

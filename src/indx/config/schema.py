@@ -41,6 +41,11 @@ class _SlotConfig(BaseModel):
     # override this; everything else on the model becomes an adapter constructor kwarg.
     _selector_fields: tuple[str, ...] = ()
 
+    # Registry slot name(s) whose registered backend names label this slot's sub-tables
+    # (``[<slot>.<backend>]``). Used to tell a backend sub-table apart from a dict-valued
+    # passthrough option. Subclasses override; ``enrich`` spans both ``llm`` and ``vlm``.
+    _registry_slots: tuple[str, ...] = ()
+
     def options(self, backend: str | None = None) -> dict[str, Any]:
         """Backend-specific kwargs to forward to the adapter constructor.
 
@@ -50,10 +55,15 @@ class _SlotConfig(BaseModel):
         selector value is used.
         """
         selector = backend if backend is not None else self._active_backend()
+        backend_names = self._backend_names()
         out: dict[str, Any] = {}
         for key, value in self._iter_passthrough():
-            if isinstance(value, dict):
-                continue  # nested sub-tables are handled below, by name
+            # A top-level dict is a backend sub-table (``[<slot>.<backend>]``) only when its
+            # key names a backend this slot can select. The active backend's sub-table is
+            # merged below; sibling backends' sub-tables are dropped. Every other dict is a
+            # legitimate dict-valued passthrough option (e.g. ``headers``) and is forwarded.
+            if isinstance(value, dict) and key in backend_names:
+                continue
             out[key] = value
         if selector is not None:
             sub = self._sub_tables().get(selector)
@@ -68,6 +78,27 @@ class _SlotConfig(BaseModel):
     def _sub_tables(self) -> dict[str, dict[str, Any]]:
         return {k: v for k, v in self._iter_passthrough() if isinstance(v, dict)}
 
+    def _backend_names(self) -> set[str]:
+        """Backend names this slot can select, used to tell a backend sub-table
+        (``[<slot>.<backend>]``) apart from a dict-valued passthrough option.
+
+        Sourced from the registry's static built-in table (no heavy imports) so *every*
+        registered backend for this slot — not just the active one — is recognised as a
+        sub-table key and never leaks into the adapter kwargs. The active selector's own
+        backend is always included so an explicitly-passed ``backend`` still resolves even
+        if it is not a built-in. ``enrich`` spans both its ``llm`` and ``vlm`` slots.
+        """
+        from indx.registry.builtins import BUILTINS
+
+        names: set[str] = set()
+        for slot in self._registry_slots:
+            names.update(BUILTINS.get(slot, {}))
+        for field in self._selector_fields:
+            value = getattr(self, field, None)
+            if isinstance(value, str) and value:
+                names.add(value.split(":", 1)[0])
+        return names
+
     def _iter_passthrough(self) -> list[tuple[str, Any]]:
         data = self.model_dump()
         return [(k, v) for k, v in data.items() if k not in self._selector_fields]
@@ -75,13 +106,14 @@ class _SlotConfig(BaseModel):
     def _active_backend(self) -> str | None:
         for name in self._selector_fields:
             value = getattr(self, name, None)
-            if isinstance(value, str):
-                return value
+            if isinstance(value, str) and value:
+                return value.split(":", 1)[0]
         return None
 
 
 class ParserConfig(_SlotConfig):
     _selector_fields = ("engine",)
+    _registry_slots = ("parser",)
     engine: str = DEFAULT_PARSER
 
 
@@ -89,6 +121,7 @@ class EnrichConfig(_SlotConfig):
     # The enrich slot carries two selectors (llm + vlm) and the metadata switch; none of
     # them are adapter passthrough kwargs.
     _selector_fields = ("llm", "vlm", "metadata")
+    _registry_slots = ("llm", "vlm")
     llm: str = DEFAULT_LLM
     vlm: str = DEFAULT_VLM
     metadata: list[str] = Field(default_factory=lambda: list(_DEFAULT_METADATA))
@@ -96,16 +129,19 @@ class EnrichConfig(_SlotConfig):
 
 class EmbedConfig(_SlotConfig):
     _selector_fields = ("model",)
+    _registry_slots = ("embedder",)
     model: str = DEFAULT_EMBEDDER
 
 
 class StoreConfig(_SlotConfig):
     _selector_fields = ("backend",)
+    _registry_slots = ("store",)
     backend: str = DEFAULT_STORE
 
 
 class OutputConfig(_SlotConfig):
     _selector_fields = ("format",)
+    _registry_slots = ("writer",)
     format: str = DEFAULT_FORMAT
 
 

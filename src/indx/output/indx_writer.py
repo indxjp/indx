@@ -15,6 +15,7 @@ from pathlib import Path
 
 from indx.archive.writer import write_archive
 from indx.core.knowledge_space import KnowledgeSpace
+from indx.errors import IndxError
 
 
 class IndxWriter:
@@ -75,6 +76,8 @@ def _write_embeddings(space: KnowledgeSpace, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     vectors = [c.embedding for c in space.chunks if c.embedding is not None]
     dim = len(vectors[0]) if vectors else (space.manifest.embedding_dim or 0)
+    if vectors and any(len(v) != dim for v in vectors):
+        raise IndxError("ragged embedding dimensions: all chunk embeddings must share one width")
     flat = array.array("f", [v for vec in vectors for v in vec])
     if sys.byteorder == "big":  # vectors.f32 is little-endian on disk
         flat.byteswap()

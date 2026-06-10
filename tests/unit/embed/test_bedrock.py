@@ -46,8 +46,9 @@ class _FakeClient:
         if modelId.startswith("cohere."):
             n = len(request["texts"])
             return {"body": _FakeBody({"embeddings": {"float": [[1.0] * self.dim] * n}})}
-        # Titan: one inputText per call; honor the requested dimensions.
-        width = request["dimensions"]
+        # Titan: one inputText per call. V2 carries a ``dimensions`` knob; V1 must NOT
+        # send ``dimensions``/``normalize`` (they are V2-only) — fall back to ``self.dim``.
+        width = request.get("dimensions", self.dim)
         return {"body": _FakeBody({"embedding": [1.0] * width})}
 
 
@@ -112,6 +113,23 @@ def test_embed_round_trips_one_vector_per_text(monkeypatch: pytest.MonkeyPatch) 
     assert client.calls[0]["body"]["inputText"] == "alpha"
     assert client.calls[0]["body"]["dimensions"] == 1024
     assert client.calls[0]["body"]["normalize"] is True
+
+
+def test_titan_v1_omits_v2_only_body_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Titan v1 requests carry only ``inputText`` — never the V2-only ``dimensions``/
+    ``normalize`` keys, which V1 rejects with a ValidationException."""
+    client = _install_fake_boto3(monkeypatch, dim=1536)
+    embedder = BedrockEmbedder(model="amazon.titan-embed-text-v1")
+    assert embedder.dim == 1536
+
+    vectors = embedder.embed(["alpha"])
+
+    assert len(vectors) == 1
+    assert len(vectors[0]) == 1536
+    body = client.calls[0]["body"]
+    assert body == {"inputText": "alpha"}
+    assert "dimensions" not in body
+    assert "normalize" not in body
 
 
 def test_embed_parses_embedding_field(monkeypatch: pytest.MonkeyPatch) -> None:

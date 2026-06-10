@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Final, cast
 
@@ -50,6 +51,7 @@ from indx.pipeline.stages import (
     RelateStage,
     WalkStage,
 )
+from indx.pipeline.stages.pack import stamp_sources
 from indx.registry import (
     discover_stages,
     get_embedder,
@@ -57,7 +59,7 @@ from indx.registry import (
     get_store,
     get_writer,
 )
-from indx.store.base import VectorStore
+from indx.store.base import VectorStore, close_store
 from indx.utils.cache import StageCache, sha256_file, sha256_text
 
 # Documented zero-config defaults per slot (sdk.md "Constructor"). Used when a slot is left
@@ -272,6 +274,10 @@ class DirectoryPipeline:
         # dim-sized store is sized to the *current* embedder; rebinding only the embedder via
         # ``use()`` must re-size it (T10), but a user-supplied store is never silently rebuilt.
         self._store_user_supplied = s_inst is not None
+        # Retain the per-slot store config so a ``use()`` rebuild (rebinding the embedder, or the
+        # store itself by name) re-applies the user's pinned connection settings (qdrant url,
+        # pgvector dsn, lancedb uri, explicit dim, …) instead of falling back to defaults.
+        self._store_opts = slot_opts.get("store", {})
         self._output_name = o_name or _DEFAULTS["output"]
         self._output = o_inst  # writer instance; resolved lazily by name when None
         self._output_opts = slot_opts.get("output", {})
@@ -321,8 +327,36 @@ class DirectoryPipeline:
         return cast(VectorStore, self._store)
 
     @property
-    def embedder(self) -> Embedder:
-        return cast(Embedder, self._embedder)
+    def embedder(self) -> Embedder | None:
+        # ``None`` when the pipeline was built (or rebound) with ``embed=False`` — the annotation
+        # is honest so callers querying right after a build get a typed Optional, not an
+        # ``AttributeError`` from a value the static type claimed was always present.
+        return self._embedder
+
+    def close(self) -> None:
+        """Release the store this pipeline constructed (best-effort, idempotent).
+
+        Registry-built stores are owned by the pipeline, so their backend resources (DB
+        connections, on-disk client handles) are released here. A user-supplied store is left
+        untouched — its lifetime belongs to the caller. ``close()`` is a no-op for stores
+        without resources to free (the default :meth:`VectorStore.close`). Safe to call more
+        than once; after ``close()`` the pipeline must not be ``run()`` again.
+
+        Long-lived hosts (the ``indx app`` build worker, CLI ``build``) should call this — or
+        use the pipeline as a context manager — so per-build stores do not accumulate handles.
+        """
+        if self._store_user_supplied:
+            return
+        store = self._store
+        self._store = None
+        if store is not None:
+            close_store(store)
+
+    def __enter__(self) -> DirectoryPipeline:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     def _new_context(self, directory: str | Path) -> SpaceContext:
         from indx.utils.zip_input import extract_zip, is_zip_input
@@ -421,7 +455,9 @@ class DirectoryPipeline:
         if store_pending is not None:
             resolved, inst = store_pending
             self._store = (
-                inst if inst is not None else _build_store(resolved, embedder=self._embedder)
+                inst
+                if inst is not None
+                else _build_store(resolved, embedder=self._embedder, options=self._store_opts)
             )
             self._store_user_supplied = inst is not None
         elif (
@@ -431,8 +467,11 @@ class DirectoryPipeline:
             and self._names["store"] in _DIM_SIZED_STORES
         ):
             # The dim-sized store was sized to the previous embedder; re-size it to the new one
-            # so the next ``run()`` does not upsert a mismatched-width vector (T10).
-            self._store = _build_store(self._names["store"], embedder=self._embedder)
+            # so the next ``run()`` does not upsert a mismatched-width vector (T10). Forward the
+            # pinned store config so the rebuild keeps targeting the configured location.
+            self._store = _build_store(
+                self._names["store"], embedder=self._embedder, options=self._store_opts
+            )
 
         self._rebind_stages()
         return self
@@ -594,11 +633,16 @@ class ResumableParseStage:
                 if cached is not None:
                     return doc.id, ParsedDoc.model_validate(cached)
                 parsed = self._parser.parse(path)  # type: ignore[attr-defined]
-                self._cache.put(self.name, input_hash, self._component_id, parsed.model_dump())
             except Exception as exc:  # per-file failure → skip (technical-spec §3.4)
                 return doc.id, StageErrorRecord(
                     stage=self.name, kind="skip", item=doc.path, message=str(exc)
                 )
+            # Persisting to the resume cache is a best-effort side channel: a write failure
+            # (disk full, read-only/unwritable --out) must not turn a cleanly-parsed document
+            # into a parse skip and discard it. Mirror StageCache.get, which already treats
+            # filesystem errors as a miss rather than a crash.
+            with suppress(OSError):
+                self._cache.put(self.name, input_hash, self._component_id, parsed.model_dump())
             return doc.id, parsed
 
         # A single worker stays fully sequential (cheap, and what the tests assert by default).
@@ -650,6 +694,7 @@ class ResumablePackStage:
         if not self._cache.enabled:
             return self._inner.run(ctx)
 
+        stamp_sources(ctx)
         chunks = ctx.space.chunks
         if chunks:
             hashes = [sha256_text(c.text) for c in chunks]

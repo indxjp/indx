@@ -15,6 +15,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any
 
+from indx.errors import StageError
 from indx.utils.lazy import require_extra
 
 if TYPE_CHECKING:
@@ -72,10 +73,15 @@ class OpenAILLM:
     def _is_reasoning_model(model: str) -> bool:
         """Return ``True`` for models that reject custom ``temperature`` on Chat Completions.
 
-        The gpt-5 family and o-series reasoning models (e.g. ``o1``, ``o3``, ``o4-mini``) only
-        accept their default temperature; sending another value returns HTTP 400.
+        The gpt-5 *reasoning* family and o-series models (e.g. ``o1``, ``o3``, ``o4-mini``) only
+        accept their default temperature; sending another value returns HTTP 400. The
+        ``gpt-5-chat*`` variants (``gpt-5-chat``, ``gpt-5-chat-latest``) are *not* reasoning
+        models: they accept a custom ``temperature`` and reject ``reasoning_effort``, so they
+        must be carved out before the ``gpt-5`` prefix test.
         """
         name = model.lower()
+        if name.startswith("gpt-5-chat"):
+            return False
         return name.startswith(("gpt-5", "o1", "o3", "o4"))
 
     def complete(
@@ -97,7 +103,11 @@ class OpenAILLM:
                 their default and so ``temperature`` is omitted for them.
 
         Returns:
-            The assistant message text, or an empty string if the model returned no content.
+            The assistant message text, or an empty string if the model returned no content
+            (including the content-filter edge case where the provider returns no choices).
+
+        Raises:
+            StageError: If the underlying OpenAI Chat Completions call fails.
         """
         client = self._ensure_client()
         messages: list[dict[str, Any]] = []
@@ -129,8 +139,18 @@ class OpenAILLM:
             # visible content, returning an empty string. ``reasoning_effort="minimal"`` keeps the
             # answer within a tight budget for the short, factual prompts the Enrich stage sends.
             kwargs["reasoning_effort"] = "minimal"
-        response = client.chat.completions.create(**kwargs)
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except Exception as exc:  # noqa: BLE001 — wrap any vendor failure at the edge
+            raise StageError(
+                "enrich",
+                f"OpenAI chat.completions.create failed for model {self.model!r}: {exc}",
+            ) from exc
         # Convert the vendor response -> core ``str`` AT THE EDGE: no openai.ChatCompletion
-        # object ever escapes this adapter into core/.
-        content = response.choices[0].message.content
+        # object ever escapes this adapter into core/. A provider returning zero choices
+        # (e.g. an Azure/OpenAI-compatible content-filter block) must yield "" not IndexError.
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            return ""
+        content = choices[0].message.content
         return content or ""

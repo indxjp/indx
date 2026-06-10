@@ -11,17 +11,29 @@ major/minor/patch mean for the CLI, the SDK, and the `.indx` artifact format.
 
 Nothing yet.
 
-## [0.0.2] — 2026-06-07
+## [0.0.3] — 2026-06-09
 
-Documentation release. No changes to the SDK, the CLI surface, or the `.indx` archive
-format (`schema_version` stays `"1"`); the wheel is functionally identical to `0.0.1`.
+A bug-fix and polish release. The headline fix: published wheels now actually
+ship the `indx app` web UI. The release pipeline builds the Next.js bundle into
+`src/indx/app/static/` before packaging and asserts it is present, so `indx app`
+serves the real interface instead of a degraded placeholder.
 
-### Docs
+### Fixed
 
-- Rewrote the README into a clearer, more inspiring landing page: a centered hero, the
-  `indx demo` transcript, a "chunk that remembers everything" walkthrough, a bring-your-own-stack
-  slot table, the AI-agent connectors, and the four target personas. This is what renders as
-  the project description on PyPI.
+- `indx app` ships its Next.js UI bundle in the published wheel. The release
+  workflow now builds the bundle before `python -m build` and verifies the
+  packaged artifact contains the real `index.html` and `_next/` assets.
+- 41 verified bugs surfaced by the multi-agent bug swarm across the pipeline and
+  CLI.
+- Web app: mobile layout collapse, a proper landing page for corrupt imports,
+  and recents that can be removed.
+- Web app: "Start organizing" is disabled when the dry-run plan fails, with a
+  hint pointing at the fix, instead of letting the user start a build that would
+  fail identically.
+
+### Added
+
+- IndexApp journey-product polish and batched embeddings for faster builds.
 
 ## [0.0.1] — 2026-06-07
 

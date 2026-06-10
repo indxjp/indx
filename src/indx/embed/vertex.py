@@ -9,6 +9,7 @@ SDK is heavy/optional, so it is imported lazily inside ``__init__`` and gated by
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 from indx.errors import StageError
@@ -77,6 +78,11 @@ class VertexEmbedder:
 
         self.model = model or _DEFAULT_MODEL
         self.name = self.model  # record the *actual* model in the manifest
+        if dim not in _SUPPORTED_DIMS:
+            raise StageError(
+                "embed",
+                f"gemini-embedding-001 supports {sorted(_SUPPORTED_DIMS)}, not {dim}.",
+            )
         self.dim = dim
         self.task_type = task_type
         self.batch_size = batch_size
@@ -113,7 +119,15 @@ class VertexEmbedder:
                 )
             except Exception as exc:  # normalize backend errors to a typed IndxError
                 raise StageError("embed", str(exc)) from exc
-            # Coerce at the adapter edge so no vendor float type leaks into core vectors.
+            # Coerce at the adapter edge so no vendor float type leaks into core vectors,
+            # then L2-normalize: gemini-embedding-001 only guarantees unit-norm at its
+            # native 3072 width, so Matryoshka-truncated widths (e.g. 768) must be
+            # re-normalized to keep cosine/dot scores comparable across backends
+            # (matches e5.py / HashEmbedder, which always emit unit vectors).
             for embedding in result.embeddings:
-                vectors.append([float(v) for v in embedding.values])
+                vec = [float(v) for v in embedding.values]
+                norm = math.sqrt(sum(x * x for x in vec))
+                if norm > 0.0:
+                    vec = [x / norm for x in vec]
+                vectors.append(vec)
         return vectors

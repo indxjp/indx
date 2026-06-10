@@ -268,6 +268,27 @@ def test_inspect_built_space(client: TestClient, corpus: Path, tmp_path: Path) -
     assert isinstance(body["types"], dict) and isinstance(body["relations"], dict)
     assert "manifest" in body
 
+    # edges are net-new: each is a document-to-document relation that joins with `documents`.
+    edges = body["edges"]
+    assert isinstance(edges, list)
+    assert len(edges) == done["counts"]["relations"]
+    # edge_total reports the true relation count (edges may be capped) so the UI can say "N of M".
+    assert body["edge_total"] == done["counts"]["relations"]
+    assert body["edge_total"] >= len(edges)
+    doc_ids = {d["id"] for d in body["documents"]}
+    for edge in edges:
+        assert set(edge) == {"source_id", "target_id", "type"}
+        # Each endpoint joins back to a real document, so the graph renders connected.
+        assert edge["source_id"] in doc_ids
+        assert edge["target_id"] in doc_ids
+        assert edge["type"]
+    # The histogram (kept for the legend) still agrees with the edge list per type.
+    if edges:
+        from collections import Counter
+
+        by_type = Counter(e["type"] for e in edges)
+        assert dict(by_type) == body["relations"]
+
 
 # --------------------------------------------------------------------------- query
 
@@ -332,3 +353,414 @@ def test_browse_defaults_to_cwd(
     body = client.get("/api/browse").json()
     assert body["path"] == str(tmp_path.resolve())
     assert "sub" in [e["name"] for e in body["entries"]]
+
+
+# --------------------------------------------------------------------------- agent
+
+
+def test_agent_frameworks_reports_install_state(client: TestClient) -> None:
+    """``/agent/frameworks`` lists every adapter with a find_spec-driven installed flag."""
+    import importlib.util
+
+    body = client.get("/api/agent/frameworks").json()
+    by_name = {f["name"]: f for f in body}
+    assert {"langchain", "openai-agents", "pydantic-ai", "claude-agent", "mcp"} <= set(by_name)
+    for info in body:
+        assert set(info) == {"name", "extra", "installed"}
+        assert isinstance(info["installed"], bool)
+    # langchain badge mirrors whether langchain_core imports.
+    expected_lc = importlib.util.find_spec("langchain_core") is not None
+    assert by_name["langchain"]["installed"] is expected_lc
+    assert by_name["langchain"]["extra"] == "langchain"
+    # mcp is installed iff EITHER fastmcp OR mcp imports.
+    expected_mcp = (
+        importlib.util.find_spec("fastmcp") is not None
+        or importlib.util.find_spec("mcp") is not None
+    )
+    assert by_name["mcp"]["installed"] is expected_mcp
+
+
+def test_agent_tools_returns_static_tool_defs(client: TestClient) -> None:
+    body = client.get("/api/agent/tools").json()
+    names = {t["name"] for t in body}
+    assert names == {"indx_search", "indx_overview", "indx_get_document"}
+    for tool in body:
+        assert {"name", "description", "parameters"} <= set(tool)
+        assert tool["parameters"]["type"] == "object"
+
+
+def test_agent_snippets_are_copy_paste_strings(client: TestClient) -> None:
+    body = client.get("/api/agent/snippets").json()
+    assert set(body) == {"python", "cli", "langchain", "llamaindex", "mcp"}
+    assert "from indx.agent import connect" in body["python"]
+    assert "indx mcp" in body["cli"]
+
+
+def test_agent_overview_over_offline_space(
+    client: TestClient, corpus: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "ks"
+    done = _build_space(client, corpus, out)
+
+    resp = client.post("/api/agent/overview", json={"space": str(out), "sample": 5})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # The real SpaceOverview shape (connector.overview).
+    assert body["documents"] == done["counts"]["docs"]
+    assert body["chunks"] == done["counts"]["chunks"]
+    assert isinstance(body["types"], dict)
+    assert len(body["sample_documents"]) <= 5
+    assert {"id", "path"} <= set(body["sample_documents"][0])
+
+
+def test_agent_search_returns_flat_hits(client: TestClient, corpus: Path, tmp_path: Path) -> None:
+    out = tmp_path / "ks"
+    _build_space(client, corpus, out)
+
+    resp = client.post(
+        "/api/agent/search",
+        json={"space": str(out), "text": "onboarding handbook", "k": 2},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["query"] == "onboarding handbook"
+    assert body["count"] == len(body["hits"])
+    assert body["hits"], "expected at least one hit from the offline lexical retriever"
+    hit = body["hits"][0]
+    # The flat Hit shape: source is a plain path string (distinct from /query's nested chunk).
+    assert {"chunk_id", "document_id", "score", "text"} <= set(hit)
+    assert isinstance(hit["score"], float)
+    assert hit["source"] is None or isinstance(hit["source"], str)
+
+
+def test_agent_document_returns_detail_and_error_sentinel(
+    client: TestClient, corpus: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "ks"
+    _build_space(client, corpus, out)
+
+    # Resolve a known document via its path suffix, like the connector does.
+    inspected = client.get("/api/inspect", params={"space": str(out)}).json()
+    a_path = inspected["documents"][0]["path"]
+
+    ok = client.post("/api/agent/document", json={"space": str(out), "path_or_id": a_path})
+    assert ok.status_code == 200, ok.text
+    detail = ok.json()
+    assert detail["path"] == a_path
+    assert {"chunk_count", "text"} <= set(detail)
+    assert "error" not in detail
+
+    # A missing id returns the {error} sentinel at HTTP 200, never a 500.
+    missing = client.post(
+        "/api/agent/document", json={"space": str(out), "path_or_id": "does/not/exist.md"}
+    )
+    assert missing.status_code == 200, missing.text
+    sentinel = missing.json()
+    assert "error" in sentinel
+    assert "does/not/exist.md" in sentinel["error"]
+
+
+# --------------------------------------------------------------------------- export
+
+
+def test_export_streams_built_space_as_download(
+    client: TestClient, corpus: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GET /api/export streams the built ``.indx`` as an attachment with a non-empty body."""
+    out = tmp_path / "ks"
+    _build_space(client, corpus, out)
+    # The export guard resolves ``space`` under the server CWD, so build/serve from tmp_path.
+    monkeypatch.chdir(tmp_path)
+
+    resp = client.get("/api/export", params={"space": str(out)})
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"] == "application/octet-stream"
+    disp = resp.headers["content-disposition"]
+    assert "attachment" in disp
+    assert ".indx" in disp
+    # A real self-contained ``.indx`` is a zip (PK magic) with a non-empty body.
+    body = resp.content
+    assert body, "export body should be non-empty"
+    assert body[:2] == b"PK"
+
+
+def test_export_rejects_path_traversal(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``space`` that escapes the server CWD tree is rejected with 400, not streamed."""
+    monkeypatch.chdir(tmp_path)
+    resp = client.get("/api/export", params={"space": "../../../../etc/passwd"})
+    assert resp.status_code == 400
+
+
+def test_export_streams_app_owned_temp_space(
+    client: TestClient, corpus: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Export reaches an app-owned ``indx-app-*`` build dir even though it's outside the CWD.
+
+    Every in-app build/demo/import writes to ``tempfile.mkdtemp(prefix="indx-app-...")`` under the
+    system temp root, so the CWD-only guard made export unreachable for anything the app produced.
+    """
+    import shutil
+    import tempfile
+
+    # Serve from an unrelated CWD so the build dir is reachable *only* via the temp-root branch.
+    monkeypatch.chdir(tmp_path)
+    app_dir = Path(tempfile.mkdtemp(prefix="indx-app-"))
+    try:
+        _build_space(client, corpus, app_dir)
+        resp = client.get("/api/export", params={"space": str(app_dir)})
+        assert resp.status_code == 200, resp.text
+        assert resp.content[:2] == b"PK"
+    finally:
+        shutil.rmtree(app_dir, ignore_errors=True)
+
+
+def test_export_rejects_non_app_temp_dir(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The temp-root allowance is scoped to ``indx-app-*`` dirs — an arbitrary /tmp path is 400.
+
+    This keeps the export from streaming any file that merely happens to live under the system
+    temp root (only the app's own build dirs are exportable).
+    """
+    import shutil
+    import tempfile
+
+    monkeypatch.chdir(tmp_path)
+    other = Path(tempfile.mkdtemp(prefix="notapp-"))
+    try:
+        resp = client.get("/api/export", params={"space": str(other)})
+        assert resp.status_code == 400
+    finally:
+        shutil.rmtree(other, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- import
+
+
+def test_import_saves_upload_under_workdir(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POST /api/import saves a small upload under the app-owned work dir and reports kind."""
+    pytest.importorskip("multipart")  # python-multipart backs fastapi's multipart parsing
+    from indx.app import api
+
+    workdir = tmp_path / "import-work"
+    monkeypatch.setenv("INDX_APP_IMPORT_DIR", str(workdir))
+    # ``_import_workdir`` is lru_cache'd for the server lifetime; drop any cached value so this
+    # test's env override is honored regardless of test ordering.
+    api._import_workdir.cache_clear()
+
+    # A real ``.indx`` upload (a zip carrying manifest.json) is classified as a ready-to-inspect
+    # space. Import validates the archive structure, so fake bytes would be rejected (see below).
+    indx_bytes = _minimal_indx_archive()
+    resp = client.post(
+        "/api/import",
+        files={"file": ("my space.indx", indx_bytes, "application/octet-stream")},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    saved = Path(body["path"])
+    assert body["kind"] == "space"
+    assert saved.is_file()
+    assert saved.read_bytes() == indx_bytes
+    # The saved file lives under the app-owned work dir, with a sanitized (no-space) basename.
+    assert saved.parent == workdir.resolve()
+    assert " " not in saved.name
+
+    # A non-``.indx`` upload is classified as raw build input.
+    raw = client.post(
+        "/api/import",
+        files={"file": ("notes.zip", b"raw-bytes", "application/zip")},
+    )
+    assert raw.status_code == 200, raw.text
+    assert raw.json()["kind"] == "raw"
+
+
+def _minimal_indx_archive() -> bytes:
+    """Smallest bytes that pass the import validator: a zip carrying ``manifest.json``."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("manifest.json", "{}")
+    return buf.getvalue()
+
+
+def test_import_rejects_bogus_indx_archive(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``.indx`` upload that is not a real archive is rejected up front with a clean 400.
+
+    Regression guard for the dogfood finding where a truncated/mis-renamed ``.indx`` was reported
+    as a ``space``; the UI opened it optimistically and the failure only surfaced one step later as
+    a raw loader error referencing the internal temp path. Reject at import instead.
+    """
+    pytest.importorskip("multipart")
+    from indx.app import api
+
+    workdir = tmp_path / "import-work"
+    monkeypatch.setenv("INDX_APP_IMPORT_DIR", str(workdir))
+    api._import_workdir.cache_clear()
+
+    # Not a zip at all.
+    bogus = client.post(
+        "/api/import",
+        files={"file": ("broken.indx", b"this is not a zip", "application/octet-stream")},
+    )
+    assert bogus.status_code == 400, bogus.text
+    assert "not a valid .indx archive" in bogus.json()["detail"]
+
+    # A valid zip, but missing manifest.json (e.g. an unrelated archive renamed to .indx).
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("notes.txt", "hello")
+    no_manifest = client.post(
+        "/api/import",
+        files={"file": ("renamed.indx", buf.getvalue(), "application/octet-stream")},
+    )
+    assert no_manifest.status_code == 400, no_manifest.text
+
+    # The rejected uploads do not linger in the work dir.
+    if workdir.exists():
+        assert not any(p.suffix == ".indx" for p in workdir.iterdir())
+
+
+def test_build_worker_cancels_and_removes_orphan_out_dir(corpus: Path) -> None:
+    """A cooperative stop bails the build at the next stage and deletes its temp output dir.
+
+    Models bug 2: on client disconnect the worker must not run to completion, and the temp output
+    dir it created (but never handed to the client) must not be orphaned on disk.
+    """
+    import threading
+
+    from indx.app import api
+    from indx.app.models import BuildRequest
+
+    stop = threading.Event()
+    frames: list[tuple[str | None, dict | None]] = []
+    out_dir_holder: dict[str, str] = {}
+
+    def emit(event: str | None, data: dict | None) -> None:
+        frames.append((event, data))
+        if event == "start":
+            out_dir_holder["out"] = data["out"]  # type: ignore[index]
+        if event == "stage":
+            # Simulate the client disconnecting after the first stage starts.
+            stop.set()
+
+    req = BuildRequest(directory=str(corpus), offline=True)  # no ``out`` -> mkdtemp temp dir
+    api._run_build_worker(req, emit, stop)
+
+    events = [e for e, _ in frames]
+    assert "done" not in events, events  # cancelled, never completed
+    assert events[-1] is None  # the terminal sentinel still fires
+    # The orphan temp output dir the worker created was cleaned up on cancel.
+    out_dir = out_dir_holder.get("out")
+    assert out_dir is not None
+    assert not Path(out_dir).exists(), out_dir
+
+
+def test_import_workdir_default_is_private_mkdtemp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no override, the import dir is an unpredictable mkdtemp dir at mode 0700.
+
+    A predictable, world-traversable shared dir would let a co-tenant read other users' imported
+    ``.indx`` spaces (or pre-plant a symlink); mkdtemp gives a fresh random 0700 dir each process.
+    """
+    import os
+    import stat
+
+    from indx.app import api
+
+    monkeypatch.delenv("INDX_APP_IMPORT_DIR", raising=False)
+    api._import_workdir.cache_clear()
+    try:
+        workdir = api._import_workdir()
+        assert workdir.is_dir()
+        assert workdir.name.startswith(api._IMPORT_WORKDIR_PREFIX)
+        mode = stat.S_IMODE(os.stat(workdir).st_mode)
+        assert mode == 0o700, oct(mode)
+        # lru_cache keeps the dir stable across requests.
+        assert api._import_workdir() == workdir
+    finally:
+        api._import_workdir.cache_clear()
+
+
+def test_import_workdir_refuses_symlinked_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-existing symlink at the override path is refused (no redirect of uploads)."""
+    from indx.app import api
+
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "planted"
+    link.symlink_to(real, target_is_directory=True)
+
+    monkeypatch.setenv("INDX_APP_IMPORT_DIR", str(link))
+    api._import_workdir.cache_clear()
+    try:
+        with pytest.raises(ValueError, match="symlink"):
+            api._import_workdir()
+    finally:
+        api._import_workdir.cache_clear()
+
+
+def test_import_cleans_up_partial_file_on_write_error(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write failure mid-upload removes the partial file instead of orphaning it on disk.
+
+    Cleanup must cover any abort (OSError/ClientDisconnect), not only the over-cap 413 case.
+    """
+    pytest.importorskip("multipart")
+    from indx.app import api
+
+    workdir = tmp_path / "import-work"
+    monkeypatch.setenv("INDX_APP_IMPORT_DIR", str(workdir))
+    api._import_workdir.cache_clear()
+
+    real_open = Path.open
+
+    class _BoomHandle:
+        """Wraps a real file handle but fails every ``write`` (simulating ENOSPC mid-stream)."""
+
+        def __init__(self, fh: object) -> None:
+            self._fh = fh
+
+        def write(self, _chunk: bytes) -> int:
+            raise OSError("simulated ENOSPC")
+
+        def close(self) -> None:
+            self._fh.close()
+
+    class _BoomCtx:
+        def __init__(self, path: Path, args: tuple, kwargs: dict) -> None:
+            self._real = real_open(path, *args, **kwargs)
+
+        def __enter__(self) -> _BoomHandle:
+            return _BoomHandle(self._real.__enter__())
+
+        def __exit__(self, *exc: object) -> object:
+            return self._real.__exit__(*exc)
+
+    def boom_open(self: Path, *args: object, **kwargs: object) -> object:
+        return _BoomCtx(self, args, kwargs)
+
+    monkeypatch.setattr(Path, "open", boom_open)
+
+    with pytest.raises(OSError, match="simulated ENOSPC"):
+        client.post(
+            "/api/import",
+            files={"file": ("notes.zip", b"raw-bytes", "application/zip")},
+        )
+
+    monkeypatch.undo()
+    api._import_workdir.cache_clear()
+    # No partial file was left behind under the work dir.
+    assert list(workdir.iterdir()) == []

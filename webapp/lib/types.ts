@@ -162,6 +162,13 @@ export interface InspectDocument {
   chunks: number;
 }
 
+/** A relation between two documents, surfaced for the relationship graph. */
+export interface RelationEdge {
+  source_id: string;
+  target_id: string;
+  type: string;
+}
+
 export interface InspectResponse {
   path: string;
   manifest: Manifest;
@@ -169,6 +176,9 @@ export interface InspectResponse {
   types: Record<string, number>;
   relations: Record<string, number>;
   documents: InspectDocument[];
+  edges: RelationEdge[];
+  // True relation count; `edges` is capped server-side, so the graph reports "N of M".
+  edge_total: number;
 }
 
 // ------------------------------------------------------------------------ query
@@ -176,6 +186,14 @@ export interface Source {
   path: string;
   folder: string;
   type: string | null;
+}
+
+/** An inter-chunk relation (src/indx/core/relation.py). Serialized on every Chunk. */
+export interface Relation {
+  src: string;
+  dst: string;
+  type: 'sibling' | 'parent' | 'references' | 'continues' | 'duplicate-of';
+  score: number;
 }
 
 export interface Chunk {
@@ -188,6 +206,7 @@ export interface Chunk {
   embedding: number[] | null;
   source: Source | null;
   metadata: Record<string, unknown>;
+  relations: Relation[];
   // `index` and `neighbors` are plain Python @property (not @computed_field), so pydantic's
   // model_dump() does NOT emit them. Derive client-side from position / prev_id+next_id.
   index?: number;
@@ -230,4 +249,84 @@ export interface BrowseResponse {
   path: string;
   parent: string | null;
   entries: BrowseEntry[];
+}
+
+// ------------------------------------------------------------------------ agent
+/** An agent framework (langchain/llamaindex/mcp/...) and whether its extra is installed. */
+export interface FrameworkInfo {
+  name: string;
+  extra: string; // backend FrameworkInfo.extra is non-optional; always a non-empty string
+  installed: boolean;
+}
+
+/** A tool the agent exposes; `parameters` is a JSON-schema-ish object. */
+export interface ToolDef {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+}
+
+/** A flat search hit from /agent/search. NB: `source` is a plain path string here,
+ *  NOT the nested Source object used by /api/query's hit.chunk.source. */
+export interface AgentHit {
+  chunk_id: string;
+  document_id: string;
+  score: number;
+  text: string;
+  source: string | null;
+  folder: string;
+  doc_type: string | null;
+  topics: string[];
+  tags: string[];
+  context: string[];
+}
+
+export interface AgentSearchResults {
+  query: string;
+  count: number;
+  hits: AgentHit[];
+}
+
+/** A compact document summary card returned by the agent overview/document endpoints. */
+export interface DocumentCard {
+  id: string;
+  path: string;
+  doc_type: string | null;
+  folder: string;
+  topics: string[];
+  tags: string[];
+  summary: string | null;
+}
+
+export interface SpaceOverview {
+  name: string;
+  documents: number;
+  chunks: number;
+  relations: number;
+  embeddings: number;
+  embedding_model: string | null;
+  embedding_dim: number | null;
+  types: Record<string, number>;
+  sample_documents: DocumentCard[];
+}
+
+export interface DocumentDetail extends DocumentCard {
+  chunk_count: number;
+  text: string;
+}
+
+/** Copy-paste integration snippets for each framework. */
+export interface SnippetsResponse {
+  python: string;
+  cli: string;
+  langchain: string;
+  llamaindex: string;
+  mcp: string;
+}
+
+// --------------------------------------------------------------------- import
+/** Result of importing a .indx upload; `kind` distinguishes a built space from raw sources. */
+export interface ImportResponse {
+  path: string;
+  kind: string; // 'space' | 'raw'
 }

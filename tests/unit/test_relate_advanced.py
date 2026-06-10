@@ -176,3 +176,57 @@ def test_references_across_file_types(tmp_path: Path, ext: str) -> None:
     (tmp_path / f"dst{ext}").write_text("destination\n")
     refs = _edges(_build(tmp_path), RelationType.REFERENCES)
     assert (f"src{ext}", f"dst{ext}") in refs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _norm_path — strip only a literal ``./`` prefix, never leading dots of a name
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_norm_path_preserves_leading_dot_in_filename() -> None:
+    from indx.pipeline.stages.relate import _norm_path
+
+    # A dotfile must not be collapsed onto its non-dot namesake (str.lstrip('./') bug).
+    assert _norm_path(".config.md") == ".config.md"
+    assert _norm_path(".config.md") != _norm_path("config.md")
+    # A leading dot-folder must keep its dot.
+    assert _norm_path(".github/ci.md") == ".github/ci.md"
+    # The literal ``./`` prefix is still stripped, including repeats.
+    assert _norm_path("./docs/a.md") == "docs/a.md"
+    assert _norm_path("././a.md") == "a.md"
+    # Backslashes, trailing slash and case still normalize.
+    assert _norm_path("Docs\\B.MD/") == "docs/b.md"
+
+
+def test_references_resolves_dotfolder_mention(tmp_path: Path) -> None:
+    # A reference into a dot-folder must resolve to the real file, not a mangled path.
+    (tmp_path / "guide.md").write_text("CI lives in [ci](.github/ci.md).\n")
+    (tmp_path / ".github").mkdir()
+    (tmp_path / ".github" / "ci.md").write_text("pipeline\n")
+    refs = _edges(_build(tmp_path), RelationType.REFERENCES)
+    assert ("guide.md", ".github/ci.md") in refs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# continues — only explicit part/p markers, not bare numeric (year/version) suffixes
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_continues_links_explicit_part_files(tmp_path: Path) -> None:
+    (tmp_path / "guide-part1.md").write_text("Part one.\n")
+    (tmp_path / "guide-part2.md").write_text("Part two.\n")
+    cont = _edges(_build(tmp_path), RelationType.CONTINUES)
+    assert ("guide-part1.md", "guide-part2.md") in cont
+
+
+def test_continues_not_emitted_for_year_suffixed_files(tmp_path: Path) -> None:
+    # report2024 / report2025 are distinct yearly reports, NOT a reading sequence (R-3).
+    (tmp_path / "report2024.md").write_text("Year 2024.\n")
+    (tmp_path / "report2025.md").write_text("Year 2025.\n")
+    assert _edges(_build(tmp_path), RelationType.CONTINUES) == set()
+
+
+def test_continues_not_emitted_for_version_suffixed_files(tmp_path: Path) -> None:
+    (tmp_path / "spec-v1.md").write_text("Version one.\n")
+    (tmp_path / "spec-v2.md").write_text("Version two.\n")
+    assert _edges(_build(tmp_path), RelationType.CONTINUES) == set()
