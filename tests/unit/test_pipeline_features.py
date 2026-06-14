@@ -22,6 +22,33 @@ from indx.utils.cache import CACHE_DIRNAME, StageCache, sha256_text
 OFFLINE = {"parser": "plaintext", "llm": "none", "embedder": "hash", "store": "jsonl"}
 
 
+class _FakeLLM:
+    """A no-network stand-in LLM: records prompts and returns a canned enrichment reply (H2)."""
+
+    name = "fake-llm"
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def complete(
+        self,
+        prompt: str,
+        *,
+        system: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float = 0.0,
+    ) -> str:
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "system": system,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+        )
+        return "SUMMARY: A canned summary from the fake llm.\nTOPICS: alpha, beta, gamma"
+
+
 def _tree(root: Path) -> Path:
     (root / "a").mkdir(parents=True)
     (root / "a" / "one.md").write_text("# One\n\nAlpha beta gamma delta.\n")
@@ -77,6 +104,63 @@ def test_output_is_identical_regardless_of_worker_count(tmp_path: Path) -> None:
     assert [c.id for c in one.chunks] == [c.id for c in many.chunks]
     assert [c.text for c in one.chunks] == [c.text for c in many.chunks]
     assert [c.embedding for c in one.chunks] == [c.embedding for c in many.chunks]
+
+
+def test_constructor_out_persists_output_on_run(tmp_path: Path) -> None:
+    """L1: a constructor ``out=`` is the default output destination when run() omits ``out``."""
+    src = _tree(tmp_path / "src")
+    out = tmp_path / "built"
+    _pipeline(out=out).run(src)  # run() out omitted -> falls back to constructor out
+    assert (out / "handbook.indx").exists()
+
+
+def test_run_out_none_overrides_constructor_out(tmp_path: Path) -> None:
+    """L1: ``run(out=None)`` explicitly disables writing even when the constructor set ``out=``."""
+    src = _tree(tmp_path / "src")
+    out = tmp_path / "built"
+    _pipeline(out=out).run(src, out=None)
+    assert not (out / "handbook.indx").exists()
+
+
+def test_run_out_arg_wins_over_constructor_out(tmp_path: Path) -> None:
+    """L1: ``run(out=...)`` writes to its own path, not the constructor's."""
+    src = _tree(tmp_path / "src")
+    ctor_out = tmp_path / "ctor"
+    run_out = tmp_path / "run"
+    _pipeline(out=ctor_out).run(src, out=run_out)
+    assert (run_out / "handbook.indx").exists()
+    assert not (ctor_out / "handbook.indx").exists()
+
+
+def test_no_constructor_out_stays_in_memory(tmp_path: Path) -> None:
+    """L1 guard: with no constructor ``out=`` and run() out omitted, nothing is written."""
+    src = _tree(tmp_path / "src")
+    out = tmp_path / "nope"
+    _pipeline().run(src)  # in-memory
+    assert not out.exists()
+
+
+def test_parse_failures_surfaced_on_space(tmp_path: Path) -> None:
+    """H1: parse-stage skips are counted onto ``space.parse_failures_`` and IngestResult."""
+
+    class _BoomParser:
+        name = "boom-parser"
+        version = "1"
+
+        def parse(self, path: Path) -> object:
+            raise RuntimeError("cannot parse")
+
+    src = _tree(tmp_path / "src")  # three files
+    pipe = DirectoryPipeline(parser=_BoomParser(), store="jsonl", embedder="hash")
+    space = pipe.run(src)
+    assert space.parse_failures_ == 3  # every file failed to parse
+    assert space.chunks == []  # nothing parsed -> nothing chunked
+
+
+def test_parse_failures_zero_on_clean_build(tmp_path: Path) -> None:
+    src = _tree(tmp_path / "src")
+    space = _pipeline().run(src)
+    assert space.parse_failures_ == 0
 
 
 def test_jobs_defaults_to_cpu_count(tmp_path: Path) -> None:
@@ -332,37 +416,80 @@ def _enrich_stage(pipe: DirectoryPipeline) -> EnrichStage:
     return stage
 
 
-def test_build_does_not_claim_llm_or_vlm_provenance(tmp_path: Path) -> None:
-    """build --llm/--vlm must not be recorded as build provenance — no LLM runs at build time.
+def test_build_records_explicit_llm_provenance_honestly(tmp_path: Path) -> None:
+    """H2: an EXPLICIT build-time llm is used for enrichment and recorded honestly.
 
-    The deterministic Enrich stage uses no model, so stamping ``llm=openai`` into the
-    manifest/components would be a false claim (Bug #5). Provenance for these two slots is ``none``
-    regardless of what was requested; parser/embedder/store stay truthful.
+    The deterministic scaffold runs by default, but when the user explicitly wires an llm in
+    (here a fake instance, so no network/extra is needed) the build *does* use it for enrichment,
+    so provenance must read the llm's real name — not ``none``. ``vlm`` stays ``none`` (no
+    build-time VLM enricher); parser/embedder/store stay truthful.
     """
     pipe = DirectoryPipeline(
         parser="plaintext",
         store="jsonl",
-        llm="openai",
+        llm=_FakeLLM(),
         vlm="openai",
         embedder="hash",
         embed=False,
     )
-    assert pipe._names["llm"] == "none"
+    assert pipe._names["llm"] == "fake-llm"
     assert pipe._names["vlm"] == "none"
-    # Regression guard: the fix only narrowed llm/vlm; other slots are still recorded truthfully.
     assert pipe._names["parser"] == "plaintext"
     assert pipe._names["store"] == "jsonl"
 
 
-def test_manifest_components_report_llm_none_after_run(tmp_path: Path) -> None:
+def test_build_without_explicit_llm_reports_none(tmp_path: Path) -> None:
+    """The zero-config / default path never resolves or records an llm (offline promise)."""
     src = _tree(tmp_path / "src")
-    pipe = DirectoryPipeline(
-        parser="plaintext", store="jsonl", embedder="hash", llm="openai", vlm="openai"
-    )
+    # ``llm`` omitted -> config default (DEFAULT_LLM) -> NOT explicit -> stays none/offline.
+    pipe = DirectoryPipeline(parser="plaintext", store="jsonl", embedder="hash")
     space = pipe.run(src)
     assert space.manifest.components["llm"] == "none"
     assert space.manifest.components["vlm"] == "none"
     assert space.manifest.components["parser"] == "plaintext"
+
+
+def test_explicit_llm_instance_drives_summary_and_topics(tmp_path: Path) -> None:
+    """H2 end-to-end (no network): a fake llm INSTANCE drives summary/topics + honest provenance."""
+    src = _tree(tmp_path / "src")
+    fake = _FakeLLM()
+    pipe = DirectoryPipeline(parser="plaintext", store="jsonl", embedder="hash", llm=fake)
+    space = pipe.run(src)
+    assert fake.calls  # the fake llm was actually invoked
+    assert all(c["temperature"] == 0.0 for c in fake.calls)  # deterministic prompt
+    assert space.manifest.components["llm"] == "fake-llm"  # honest provenance
+    for doc in space.documents():
+        assert doc.summary == "A canned summary from the fake llm."
+        assert doc.topics == ["alpha", "beta", "gamma"]
+
+
+def test_default_path_uses_heuristics_not_llm(tmp_path: Path) -> None:
+    """Without an explicit llm, summary/topics come from the offline heuristics, llm='none'."""
+    src = _tree(tmp_path / "src")
+    pipe = DirectoryPipeline(parser="plaintext", store="jsonl", embedder="hash")
+    space = pipe.run(src)
+    assert space.manifest.components["llm"] == "none"
+    for doc in space.documents():
+        # Heuristic summary/topics, never the fake canned strings.
+        assert doc.summary != "A canned summary from the fake llm."
+        assert doc.topics != ["alpha", "beta", "gamma"]
+
+
+def test_llm_failure_falls_back_to_heuristic(tmp_path: Path) -> None:
+    """A per-doc llm error must not abort the build — the doc falls back to heuristic enrichment."""
+
+    class _BoomLLM:
+        name = "boom-llm"
+
+        def complete(self, prompt: str, **kw: object) -> str:
+            raise RuntimeError("creds error")
+
+    src = _tree(tmp_path / "src")
+    pipe = DirectoryPipeline(parser="plaintext", store="jsonl", embedder="hash", llm=_BoomLLM())
+    space = pipe.run(src)  # must not raise
+    for doc in space.documents():
+        assert doc.summary  # heuristic summary populated despite llm failure
+        assert doc.topics
 
 
 def test_use_does_not_reintroduce_llm_provenance(tmp_path: Path) -> None:

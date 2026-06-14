@@ -67,7 +67,21 @@ class MarkItDownParser:
         try:
             result = converter.convert(str(path))
         except Exception as exc:  # vendor exception — translate at the edge (§6.2/§8)
-            raise StageError("parse", f"markitdown failed: {exc}", path=str(path)) from exc
+            # MarkItDown raises a MissingDependencyException when the per-format converter
+            # for this file type needs an optional dependency that isn't installed (e.g. its
+            # PDF support, pulled by ``markitdown[pdf]``). Detect that flavor by the vendor
+            # exception's class name (NO runtime import of the vendor's exception type or any
+            # pdf lib — the firewall keeps vendor objects out) and surface a clear hint so a
+            # parse skip isn't mistaken for a corrupt file. Otherwise keep the generic message.
+            if "missingdependency" in type(exc).__name__.lower():
+                msg = (
+                    f"markitdown is missing an optional dependency for this file type "
+                    f"(likely a format whose extra is not installed, e.g. PDF needs "
+                    f"markitdown[pdf]): {exc}"
+                )
+            else:
+                msg = f"markitdown failed: {exc}"
+            raise StageError("parse", msg, path=str(path)) from exc
 
         # `result` is a vendor result object — it must not escape this method.
         text = result.text_content or ""

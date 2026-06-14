@@ -9,6 +9,39 @@ major/minor/patch mean for the CLI, the SDK, and the `.indx` artifact format.
 
 ## [Unreleased]
 
+## [0.0.6] — 2026-06-15
+
+A bug-fix release resolving 11 bugs surfaced by an end-to-end bug-hunt over a clean
+`pip install indx` with real downloaded documents (PDFs, HTML, CSV, unicode) and live
+OpenAI/Anthropic keys. Each fix ships with a regression test; validated offline and live.
+No schema change.
+
+### Fixed
+
+- **Silent parse failures are surfaced.** A file the parser cannot decode (e.g. a binary
+  PDF under the offline plaintext parser) was indexed as a 0-chunk document with no warning
+  and exit 0. `build`/`add` now count parse failures (`space.parse_failures_`), warn in
+  yellow, and report `parse_failures` in `--json`; non-strict exit stays 0.
+- **Build-time LLM enrichment.** An explicitly-configured build LLM is now actually used to
+  generate `summary`/`topics` instead of being silently discarded. Gated to an explicit
+  selection only — the zero-config/air-gapped default still records `llm = none` and uses
+  the deterministic offline enricher (no network).
+- **Federated query with a real embedder.** Querying a composed parent no longer fails with
+  `dimension mismatch` — the embedder is resolved from the children when the parent names
+  none, and `compose` stamps the parent's embedding provenance from its children.
+- **Offline `ask` no longer double-prints citations.** The extractive answer no longer
+  embeds a `Sources:` block; the source list is rendered once by the CLI.
+- **Offline `ask` extracts relevant text.** Instead of dumping raw chunk excerpts (which the
+  Markdown renderer collapsed to a blank body for tables), it does deterministic
+  query-relevant sentence extraction and neutralizes pipe-table rows.
+- **`indx[markitdown]` parses PDFs.** The extra now installs `markitdown[pdf]`.
+- **`DirectoryPipeline(out=…)`** now persists output from `run()` (was resume-cache only).
+- **`query -k`** validates `k >= 1` (was empty/negative-sliced results for `-k 0` / `-k -3`).
+- **No-op `add`** reports the yellow "no documents added" message instead of a contradictory
+  green `+0 docs · +0 chunks`.
+- **HTML via the offline parser** is tag-stripped (stdlib only) instead of indexing raw markup.
+- **CJK topics** use 2-char bigram segmentation instead of one ideograph per token.
+
 ## [0.0.5] — 2026-06-14
 
 A bug-fix release resolving 25 bugs surfaced by an end-to-end bug-hunt over the 0.0.4

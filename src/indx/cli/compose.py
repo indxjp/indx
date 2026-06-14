@@ -79,6 +79,26 @@ def compose_command(
         if space.remove_child(nm) is not None:
             removed.append(nm)
 
+    # Honest provenance: a composed parent is otherwise embedder-blind (components={},
+    # embedding_model=None), which would make a federated search fall back to "hash" (256-dim) and
+    # mismatch the children's real vectors. Stamp the parent's embedder from the first child that
+    # names one when the parent has none, so flatten()'s copied manifest carries it too. Only stamp
+    # when the parent is unembedded itself (it has no chunks of its own); never override an
+    # existing parent embedder.
+    if space.manifest.children and space.manifest.embedding_model is None:
+        for child_space in space.children():
+            cm = child_space.manifest
+            child_embedder = cm.components.get("embedder") or cm.embedding_model
+            if child_embedder:
+                space.manifest.embedding_model = cm.embedding_model
+                space.manifest.embedding_dim = cm.embedding_dim
+                if "embedder" not in space.manifest.components:
+                    space.manifest.components = {
+                        **space.manifest.components,
+                        "embedder": child_embedder,
+                    }
+                break
+
     space.save(str(parent_archive))
 
     if names:

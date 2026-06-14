@@ -361,7 +361,8 @@ def test_f4_home_ask_sdk_offline_extractive(tmp_path: Path) -> None:
     assert isinstance(answer, Answer)
     assert answer.llm == "none"  # offline default, no model touched
     assert answer.hits
-    assert "Sources:" in answer.answer
+    # M1: source list lives in answer.sources, not embedded as a "Sources:" block in the body.
+    assert "Sources:" not in answer.answer
     assert any("note.txt" in s for s in answer.sources)
 
 

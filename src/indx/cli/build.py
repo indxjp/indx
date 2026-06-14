@@ -210,8 +210,11 @@ def build_command(
         return
 
     with console.status("[bold]indexing…"):
+        # out=None keeps run() in-memory: the CLI writes once below via the resolved writer with
+        # the requested archive name. (L1 makes run() default to the constructor out=, so passing
+        # out=None here avoids a redundant double-write to the same path.)
         space = pipeline.run(
-            directory, on_stage=lambda s: console.log(f"stage: {s}"), stages=stage_subset
+            directory, out=None, on_stage=lambda s: console.log(f"stage: {s}"), stages=stage_subset
         )
 
     writer.write(space, Path(out), name=name)
@@ -229,6 +232,19 @@ def build_command(
         f"embedder={components['embedder']} store={components['store']} "
         f"format={components['format']}"
     )
+    # H1: surface files that reached the parse stage but yielded no chunks (a parse failure,
+    # indexed with 0 chunks). Non-fatal in non-strict mode (strict already raises), so warn
+    # prominently and keep exit 0 — the build still produced a usable archive.
+    _warn_parse_failures(space.parse_failures_)
+
+
+def _warn_parse_failures(parse_failures: int) -> None:
+    """Warn (yellow, exit 0) when ``parse_failures`` files were indexed with 0 chunks (H1)."""
+    if parse_failures > 0:
+        console.print(
+            f"[yellow]![/yellow] {parse_failures} file(s) could not be parsed and were "
+            "indexed with 0 chunks (try a richer parser, e.g. indx[docling])"
+        )
 
 
 def _warn_truncated_build(stage_names: list[str], stage_subset: list[str] | None) -> None:
@@ -308,7 +324,8 @@ def _run_json(
     def on_stage(stage_name: str) -> None:
         timings.append((stage_name, time.perf_counter()))
 
-    space = pipeline.run(directory, on_stage=on_stage, stages=stage_subset)
+    # out=None: run() stays in-memory; the JSON path writes once below (avoids L1 double-write).
+    space = pipeline.run(directory, out=None, on_stage=on_stage, stages=stage_subset)
     stages_end = time.perf_counter()
     writer.write(space, Path(out), name=name)
     end = time.perf_counter()
@@ -331,6 +348,7 @@ def _run_json(
             "relations": len(space.relations),
             "skipped": space.skipped_files_,
         },
+        "parse_failures": space.parse_failures_,
         "elapsed_s": round(end - start, 6),
         "stages": stages,
         "components": components,

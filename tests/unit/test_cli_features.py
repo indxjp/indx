@@ -155,6 +155,51 @@ def test_usage_error_exits_2() -> None:
     assert result.exit_code == 2
 
 
+def test_query_k_zero_is_usage_error(tmp_path: Path) -> None:
+    """L2: ``-k 0`` is rejected as a usage error (exit 2) rather than printing an empty table."""
+    out = _build(tmp_path)
+    result = runner.invoke(app, ["query", "onboarding", str(out), "-k", "0"])
+    assert result.exit_code == 2
+    assert "k must be >= 1" in result.output
+
+
+def test_query_k_negative_is_usage_error(tmp_path: Path) -> None:
+    """L2: a negative ``-k`` is rejected (exit 2), not silently negative-sliced."""
+    out = _build(tmp_path)
+    result = runner.invoke(app, ["query", "onboarding", str(out), "-k", "-3"])
+    assert result.exit_code == 2
+    assert "k must be >= 1" in result.output
+
+
+def test_build_json_carries_parse_failures(tmp_path: Path) -> None:
+    """H1: ``build --json`` includes an integer ``parse_failures`` count."""
+    src = _src(tmp_path)
+    out = tmp_path / "space.indx"
+    result = runner.invoke(app, ["build", str(src), "--out", str(out), "--json", *OFFLINE])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["parse_failures"] == 0
+
+
+def test_build_warns_on_parse_failures_exit_0(tmp_path: Path, monkeypatch) -> None:
+    """H1: a build with parse failures prints a yellow warning naming the count, exit 0."""
+    from indx.pipeline import DirectoryPipeline
+
+    src = _src(tmp_path)
+    out = tmp_path / "space.indx"
+    real_run = DirectoryPipeline.run
+
+    def run_with_failure(self, directory, **kwargs):  # type: ignore[no-untyped-def]
+        space = real_run(self, directory, **kwargs)
+        space.parse_failures_ = 2
+        return space
+
+    monkeypatch.setattr(DirectoryPipeline, "run", run_with_failure)
+    result = runner.invoke(app, ["build", str(src), "--out", str(out), *OFFLINE])
+    assert result.exit_code == 0, result.output
+    assert "2 file(s) could not be parsed" in result.stdout
+
+
 def test_missing_archive_exits_4(tmp_path: Path) -> None:
     """inspect/query against a dir with no .indx exits 4 (ArchiveError, audit cli §3)."""
     empty = tmp_path / "empty"

@@ -193,6 +193,38 @@ def test_add_child_in_memory_relative_ref_does_not_pin(tmp_path: Path) -> None:
     assert [k for k in kids]  # resolved without ArchiveError
 
 
+def test_federated_search_resolves_child_embedder_not_hash(tmp_path: Path, monkeypatch) -> None:
+    # H3: a composed parent has components={} / embedding_model=None, so flatten()'s copied
+    # manifest names no embedder. Falling through to "hash" (256-dim) would mismatch children's
+    # real (e.g. 1536-dim) vectors. search() must resolve the embedder from the children instead.
+    from indx.embed.hash_embedder import HashEmbedder
+
+    # Build a child and stamp its manifest with a real (non-hash) embedder name + dim.
+    child = tmp_path / "child.indx"
+    _build(tmp_path / "cc", [("c.txt", "real child gamma payroll")], child)
+    loaded_child = read_archive(child)
+    loaded_child.manifest.embedding_model = "openai:text-embedding-3-small"
+    loaded_child.manifest.embedding_dim = 1536
+    loaded_child.manifest.components = {"embedder": "openai:text-embedding-3-small"}
+    write_archive(loaded_child, child)
+
+    # Parent: empty manifest, references the child (federated).
+    parent = KnowledgeSpace()
+    parent._bind_source(tmp_path / "p.indx")
+    parent.add_child("c", "child.indx")
+
+    requested: list[str] = []
+
+    def _fake_get_embedder(name: str = "hash", **_kw: object) -> HashEmbedder:
+        requested.append(name)
+        return HashEmbedder()
+
+    monkeypatch.setattr("indx.registry.get_embedder", _fake_get_embedder, raising=True)
+    parent.search("payroll", k=3)
+    # The embedder resolved for the federated query is the CHILD's, never the "hash" fallback.
+    assert requested == ["openai:text-embedding-3-small"]
+
+
 def test_add_child_absolute_ref_pins_and_resolves(tmp_path: Path) -> None:
     """An absolute ref still auto-pins (pin path == resolve path) and resolves cleanly."""
     from indx.archive import format as fmt
