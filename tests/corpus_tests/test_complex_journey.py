@@ -102,7 +102,7 @@ def test_cli_build_inspect_query_roundtrip(tmp_path: Path) -> None:
     assert inspect.exit_code == 0, inspect.output
     assert "documents=24" in inspect.stdout
 
-    query = runner.invoke(app, ["query", str(out), "retirement 401k matching", "-k", "2"])
+    query = runner.invoke(app, ["query", "retirement 401k matching", str(out), "-k", "2"])
     assert query.exit_code == 0, query.output
     assert query.stdout.strip()
 

@@ -14,25 +14,33 @@ from pathlib import Path
 from rich.markup import escape
 from rich.table import Table
 
-from indx.cli._render import console, load_space
+from indx.cli._render import console, parent_only, resolve_target
 
 
 def query_command(
-    space_path: Path,
+    space_path: Path | None,
     text: str,
     *,
     k: int = 5,
     type_: str | None = None,
     json_out: bool = False,
+    no_children: bool = False,
 ) -> None:
-    space = load_space(space_path)
+    # F4: an explicit path wins; with no path the home space ($INDX_HOME) is the target.
+    loaded = resolve_target(space_path)
+    # Feature 2: federate over children unless --no-children. `search` federates internally; the
+    # `document()` lookup for a hit's source must resolve against the SAME (federated) view so a
+    # child hit's namespaced doc id resolves to its real document/lineage.
+    space = parent_only(loaded) if no_children else loaded
+    federate = bool(loaded.manifest.children) and not no_children
+    lookup = loaded.flatten() if federate else space
 
     # Over-fetch when filtering by type so the post-filter can still return k hits.
     hits = space.search(text, k=k * 5 if type_ else k)
 
     rows = []
     for hit in hits:
-        doc = space.document(hit.chunk.doc_id)
+        doc = lookup.document(hit.chunk.doc_id)
         # Type filtering: prefer the chunk's own Source.type, fall back to the parent
         # Document's detected type (inspect-and-query.mdx "Query flags").
         hit_type = (hit.source.type if hit.source else None) or (doc.doc_type if doc else None)

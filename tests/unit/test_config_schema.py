@@ -7,7 +7,10 @@ silently dropped, never reaching the adapter constructor.
 
 from __future__ import annotations
 
-from indx.config.schema import Config, StoreConfig
+import pytest
+from pydantic import ValidationError
+
+from indx.config.schema import Config, StoreConfig, WalkConfig
 
 
 def test_options_forwards_dict_valued_passthrough_option() -> None:
@@ -63,3 +66,27 @@ def test_slot_options_preserves_store_dict_option() -> None:
     )
 
     assert cfg.slot_options()["store"]["client_kwargs"] == {"timeout": 30}
+
+
+# ── [walk] section (Feature 5) ───────────────────────────────────────────────
+
+
+def test_walk_section_validates_and_to_filter_parses_size() -> None:
+    """``[walk] max_size = "2mb"`` validates and ``to_filter()`` parses the suffix to bytes."""
+    cfg = Config.model_validate({"walk": {"ext": ["md"], "max_size": "2mb"}})
+    assert isinstance(cfg.walk, WalkConfig)
+    flt = cfg.walk.to_filter()
+    assert flt.ext == [".md"]
+    assert flt.max_size == 2097152
+
+
+def test_walk_default_is_empty_filter() -> None:
+    """A Config with no [walk] section yields an empty (no-op) filter."""
+    cfg = Config.model_validate({})
+    assert cfg.walk.to_filter().is_empty()
+
+
+def test_unknown_walk_key_is_rejected() -> None:
+    """``extra="forbid"`` turns a typo'd [walk] key into a validation error."""
+    with pytest.raises(ValidationError):
+        Config.model_validate({"walk": {"exclud": ["x"]}})

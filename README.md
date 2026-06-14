@@ -84,7 +84,42 @@ Now point it at your own folder:
 indx ./docs --out ./ai-ready.indx --offline   # index a folder, fully offline, zero extra deps
 indx inspect ./ai-ready.indx                   # structure, type histogram, relation sample
 indx query   ./ai-ready.indx "how do I onboard?"
+indx ask     ./ai-ready.indx "what is the leave policy?"   # answer with cited sources
 indx app                                       # visual configure → build → inspect → query in the browser
+```
+
+### A home knowledge base — one permanent DB, no path juggling
+
+`indx` keeps a single persistent personal space under `~/.indx/` (override with `$INDX_HOME`).
+Build, add, query, and ask **default to it** when you pass no path — so it works like a personal
+notebook you can keep adding to:
+
+```bash
+indx add  ./notes/standup.md           # append a file to the home DB (no path = home)
+indx add  ./reports                     # add a whole folder incrementally
+indx query "what did we decide about retention?"   # query home, no archive argument
+indx ask   "summarize this week's standups"        # answer with citations, offline-friendly
+indx home stats                         # counts for the home space
+indx home path                          # print the home dir
+```
+
+Incremental CRUD works on any `.indx` too — `indx add <space> <path>`, `indx rm <space> <doc|path>`,
+`indx update <space> <path>` mutate a sealed archive in place without a full rebuild.
+
+### Filter what gets indexed, run only the stages you need, compose spaces
+
+```bash
+# Conditional import: index only what matches (globs · extensions · size · depth · count)
+indx ./repo --out ./code.indx --offline --ext md --ext py \
+  --exclude '**/_drafts/**' --max-size 2mb --max-depth 3 --dry-run
+
+# Granular stages: stop after chunking (no embeddings yet), or inspect one member
+indx ./docs --out ./docs.indx --offline --through chunk
+indx inspect ./docs.indx --part documents --json
+
+# indx of indx: one parent space that federates query/inspect across child archives
+indx compose ./all.indx --add ./eng.indx --add ./design.indx
+indx query   ./all.indx "onboarding checklist"      # hits drawn from every child, globally ranked
 ```
 
 ## Why it matters: a chunk that remembers everything
@@ -139,6 +174,19 @@ for doc in space.documents(type="contract"):
 # Re-load the portable archive anywhere — no re-processing
 space = KnowledgeSpace.load("./ai-ready/handbook.indx")
 hits  = space.search("data retention", k=5)
+answer = space.ask("how long is data retained?")     # extractive offline, or LLM-synthesized
+print(answer.answer, answer.sources)
+
+# Incremental CRUD — append / re-ingest / delete without a full rebuild, then reseal
+space.add("./notes/new-policy.md")
+space.update("./notes/new-policy.md")
+space.remove("./notes/new-policy.md")
+space.save("./ai-ready/handbook.indx")
+
+# Selective load and filtered build
+from indx import WalkFilter
+docs   = KnowledgeSpace.load_part("./ai-ready/handbook.indx", "documents")  # one member only
+filtered = DirectoryPipeline(filter=WalkFilter(ext=[".md"], max_size="2mb"))
 ```
 
 The four core objects you need to know — **KnowledgeSpace**, **Document**, **Chunk**,
@@ -225,8 +273,9 @@ runs end to end and is fully air-gapped — reach it with `indx demo` or `--offl
 optional cloud/local backends (docling, openai, ollama, bge-m3, qdrant, plus the managed
 AWS/Azure/GCP profiles, …) are implemented and selected through the registry: install the
 matching extra (e.g. `pip install "indx[cloud]"`) and provide credentials to switch a slot
-onto it. The `.indx` format is at `schema_version` `"1"`; public APIs may still shift before
-`1.0` — see the [CHANGELOG](CHANGELOG.md) and the [docs](https://docs.indx.jp).
+onto it. The `.indx` format is at `schema_version` `"2"` (readers still load `"1"` archives — the
+`children` reference list is additive); public APIs may still shift before `1.0` — see the
+[CHANGELOG](CHANGELOG.md) and the [docs](https://docs.indx.jp).
 
 ## Documentation
 

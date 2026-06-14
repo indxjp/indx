@@ -34,7 +34,7 @@ def test_build_inspect_query_roundtrip(tmp_path: Path) -> None:
     assert inspect.exit_code == 0
     assert "documents=2" in inspect.stdout
 
-    query = runner.invoke(app, ["query", str(out), "onboarding handbook", "-k", "2"])
+    query = runner.invoke(app, ["query", "onboarding handbook", str(out), "-k", "2"])
     assert query.exit_code == 0
     assert "query:" in query.stdout
 

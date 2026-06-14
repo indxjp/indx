@@ -13,6 +13,7 @@ import functools
 import importlib.resources as resources
 import tempfile
 from collections.abc import Callable
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -22,7 +23,12 @@ from typer.core import TyperGroup
 
 from indx import __version__
 from indx.cli._render import console
+from indx.cli.ask import ask_command
 from indx.cli.build import build_command
+from indx.cli.compose import compose_command
+from indx.cli.crud import add_command, remove_command, update_command
+from indx.cli.home import _wire as _wire_home
+from indx.cli.home import home_app
 from indx.cli.inspect import inspect_command
 from indx.cli.query import query_command
 from indx.errors import (
@@ -192,6 +198,47 @@ def build(
     jobs: int | None = typer.Option(None, "--jobs", "-j", help="Parallel workers."),
     quiet: bool = typer.Option(False, "--quiet", help="Decrease verbosity."),
     verbose: bool = typer.Option(False, "--verbose", help="Increase verbosity."),
+    include: list[str] = typer.Option(
+        [],
+        "--include",
+        help="Keep only files whose root-relative path matches this glob (repeatable).",
+    ),
+    exclude: list[str] = typer.Option(
+        [],
+        "--exclude",
+        help="Drop files whose root-relative path matches this glob (repeatable).",
+    ),
+    ext: list[str] = typer.Option(
+        [], "--ext", help="Keep only these file extensions, e.g. --ext md --ext txt (repeatable)."
+    ),
+    name_glob: list[str] = typer.Option(
+        [],
+        "--name-glob",
+        help="Keep only files whose filename matches this glob/substring (repeatable).",
+    ),
+    min_size: str | None = typer.Option(
+        None, "--min-size", help="Drop files smaller than this (e.g. 10kb, 2mb, 512)."
+    ),
+    max_size: str | None = typer.Option(
+        None, "--max-size", help="Drop files larger than this (e.g. 10kb, 2mb, 512)."
+    ),
+    max_files: int | None = typer.Option(
+        None, "--max-files", help="Cap the number of indexed files (first N in sorted walk order)."
+    ),
+    max_depth: int | None = typer.Option(
+        None, "--max-depth", help="Limit directory nesting (0 = root files only)."
+    ),
+    stages: str | None = typer.Option(
+        None,
+        "--stages",
+        help="Comma list of stages to run (e.g. 'parse,chunk,relate'). Default: all.",
+    ),
+    through: str | None = typer.Option(
+        None, "--through", help="Run the stage prefix up to and including this stage."
+    ),
+    from_: str | None = typer.Option(
+        None, "--from", help="Run the stage suffix from this stage to the end."
+    ),
 ) -> None:
     """Process a DIRECTORY into a knowledge space (FR-CLI-1)."""
     # Resolve the mutually-exclusive cloud-preset flags to a single ``cloud`` value. Picking
@@ -225,33 +272,175 @@ def build(
         jobs=jobs,
         quiet=quiet,
         verbose=verbose,
+        include=include,
+        exclude=exclude,
+        ext=ext,
+        name_glob=name_glob,
+        min_size=min_size,
+        max_size=max_size,
+        max_files=max_files,
+        max_depth=max_depth,
+        stages=stages,
+        through=through,
+        from_stage=from_,
+    )
+
+
+class _Part(StrEnum):
+    """The members `inspect --part` can print (Feature 1)."""
+
+    documents = "documents"
+    chunks = "chunks"
+    relations = "relations"
+    manifest = "manifest"
+
+
+@app.command(name="compose")
+@_handle_errors
+def compose(
+    parent: Path = typer.Argument(..., exists=True, help="Parent .indx to edit (in place)."),
+    add: list[Path] = typer.Option(
+        [], "--add", help="Child .indx archive to reference (repeatable).", exists=True
+    ),
+    remove: list[str] = typer.Option([], "--remove", help="Child name to drop (repeatable)."),
+    name: list[str] | None = typer.Option(
+        None, "--name", help="Explicit child name(s), positionally paired with --add."
+    ),
+    no_pin: bool = typer.Option(False, "--no-pin", help="Store refs without an sha256 pin."),
+    relative_to: Path | None = typer.Option(
+        None, "--relative-to", help="Base dir for stored relative refs (default: parent dir)."
+    ),
+) -> None:
+    """Compose a parent .indx over child archives — federate inspect/query across them (F2).
+
+    Adds/removes references in the PARENT manifest only; child archives are never modified.
+    """
+    compose_command(
+        parent, add=add, remove=remove, name=name, no_pin=no_pin, relative_to=relative_to
     )
 
 
 @app.command()
 @_handle_errors
 def inspect(
-    space: Path = typer.Argument(..., exists=True, help="A .indx archive or output directory."),
+    space: Path | None = typer.Argument(
+        None,
+        exists=True,
+        help="A .indx archive or output directory (default: the home space $INDX_HOME).",
+    ),
     json_out: bool = typer.Option(False, "--json", help="Emit space stats as JSON."),
     documents: str | None = typer.Option(
         None, "--documents", help="List documents (optionally filtered by type)."
     ),
+    part: _Part | None = typer.Option(
+        None,
+        "--part",
+        help="Print just one member: documents | chunks | relations | manifest.",
+    ),
+    no_children: bool = typer.Option(
+        False,
+        "--no-children",
+        help="Limit to the parent space; do not federate over children (Feature 2).",
+    ),
 ) -> None:
     """Inspect a knowledge space: tree, types, relations, stats (FR-CLI-2)."""
-    inspect_command(space, json_out=json_out, documents=documents)
+    inspect_command(
+        space,
+        json_out=json_out,
+        documents=documents,
+        part=part.value if part is not None else None,
+        no_children=no_children,
+    )
+
+
+# NOTE: 'add'/'rm'/'update' are now known subcommands (Feature 3 CRUD), so DefaultCommandGroup
+# routes ``indx add …`` here rather than treating ``add`` as a ``<dir>`` to build. A directory
+# literally named ``add``/``rm``/``update`` is the edge case — index it explicitly as
+# ``indx ./add --out ./out`` (same documented edge as ``app``/``mcp``).
+@app.command(name="add")
+@_handle_errors
+def add(
+    path: Path = typer.Argument(..., exists=True, help="File or directory to ingest."),
+    space: Path | None = typer.Argument(
+        None,
+        exists=True,
+        help="A .indx archive or output directory (default: the home space $INDX_HOME).",
+    ),
+    name: str | None = typer.Option(None, "--name", help="Optional label (reserved)."),
+    json_out: bool = typer.Option(False, "--json", help="Emit a machine-readable add summary."),
+) -> None:
+    """Incrementally ingest a file/dir into a space (or the home space), then reseal (FR-CRUD-1)."""
+    add_command(space, path, name=name, json_out=json_out)
+
+
+@app.command(name="rm")
+@_handle_errors
+def rm(
+    target: str = typer.Argument(..., help="Document id or root-relative path to remove."),
+    space: Path | None = typer.Argument(
+        None,
+        exists=True,
+        help="A .indx archive or output directory (default: the home space $INDX_HOME).",
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit a machine-readable remove summary."),
+) -> None:
+    """Remove a document (by id or path) from a space or home, then reseal (FR-CRUD-2)."""
+    remove_command(space, target, json_out=json_out)
+
+
+@app.command(name="update")
+@_handle_errors
+def update(
+    path: Path = typer.Argument(..., exists=True, help="Changed file or directory to re-ingest."),
+    space: Path | None = typer.Argument(
+        None,
+        exists=True,
+        help="A .indx archive or output directory (default: the home space $INDX_HOME).",
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit a machine-readable update summary."),
+) -> None:
+    """Re-ingest a changed file/dir into a space (or the home space), then reseal (FR-CRUD-3)."""
+    update_command(space, path, json_out=json_out)
 
 
 @app.command()
 @_handle_errors
 def query(
-    space: Path = typer.Argument(..., exists=True, help="A .indx archive or output directory."),
     text: str = typer.Argument(..., help="Query text."),
+    space: Path | None = typer.Argument(
+        None,
+        exists=True,
+        help="A .indx archive or output directory (default: the home space $INDX_HOME).",
+    ),
     k: int = typer.Option(5, "-k", help="Number of hits."),
     type_: str | None = typer.Option(None, "--type", help="Restrict to a document type."),
     json_out: bool = typer.Option(False, "--json", help="Emit SearchHit[] as JSON."),
+    no_children: bool = typer.Option(
+        False,
+        "--no-children",
+        help="Limit to the parent space; do not federate over children (Feature 2).",
+    ),
 ) -> None:
     """Retrieve against a knowledge space and print hits with lineage (FR-CLI-3)."""
-    query_command(space, text, k=k, type_=type_, json_out=json_out)
+    query_command(space, text, k=k, type_=type_, json_out=json_out, no_children=no_children)
+
+
+@app.command(name="ask")
+@_handle_errors
+def ask(
+    question: str = typer.Argument(..., help="Question to ask."),
+    space: Path | None = typer.Argument(
+        None,
+        help="A .indx archive or output directory (default: the home space $INDX_HOME).",
+    ),
+    k: int = typer.Option(5, "-k", help="Chunks to retrieve."),
+    llm: str | None = typer.Option(
+        None, "--llm", help="Override the answering LLM ('none' for offline extractive)."
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit the Answer as JSON."),
+) -> None:
+    """Retrieve top-k and answer with citations — LLM-synthesized or offline extractive (F4)."""
+    ask_command(space, question, k=k, llm=llm, json_out=json_out)
 
 
 def _require_demo_corpus(corpus_dir: Path) -> None:
@@ -424,6 +613,15 @@ def mcp_command(
         "(Ctrl-C to stop)",
     )
     connector.serve(transport=transport)
+
+
+# Register the `indx home` sub-group (Feature 4). `_wire_home` builds the path/stats/reset
+# subcommands wrapped in this module's `_handle_errors` funnel (so the abort on a declined
+# `home reset` passes through and typed errors map to the documented exit codes), then the group
+# is mounted. Like `app`/`mcp`, `home` becomes a reserved token (a directory literally named
+# `home` must be indexed as `./home`).
+_wire_home(_handle_errors)
+app.add_typer(home_app, name="home")
 
 
 if __name__ == "__main__":  # pragma: no cover

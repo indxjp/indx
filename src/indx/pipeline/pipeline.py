@@ -22,7 +22,7 @@ on their single phase and remain swappable:
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
@@ -37,12 +37,15 @@ from indx.config.defaults import (
     DEFAULT_STORE,
     DEFAULT_VLM,
 )
+from indx.core.chunk import Chunk
 from indx.core.context import SpaceContext, StageErrorRecord
 from indx.core.document import Document
 from indx.core.knowledge_space import KnowledgeSpace, Manifest
 from indx.core.parsed import ParsedDoc
+from indx.core.relation import Relation
 from indx.embed.base import Embedder
 from indx.errors import RegistryError, StageError
+from indx.pipeline.filters import WalkFilter
 from indx.pipeline.stage import Stage
 from indx.pipeline.stages import (
     ChunkStage,
@@ -117,6 +120,7 @@ class BuildPlan:
         components: The resolved slot → name mapping the build would use.
         embed: Whether stage 06 (embed) would run.
         enrich: Whether stage 05 (enrich) would run.
+        skipped: Files dropped by the configured WalkFilter (Feature 5); 0 when unfiltered.
     """
 
     def __init__(
@@ -127,12 +131,14 @@ class BuildPlan:
         components: dict[str, str],
         embed: bool,
         enrich: bool,
+        skipped: int = 0,
     ) -> None:
         self.root = root
         self.documents = documents
         self.components = components
         self.embed = embed
         self.enrich = enrich
+        self.skipped = skipped
 
     @property
     def folders(self) -> list[str]:
@@ -214,6 +220,7 @@ class DirectoryPipeline:
         resume: bool = False,
         jobs: int | None = None,
         out: str | Path | None = None,
+        filter: WalkFilter | None = None,
     ) -> None:
         cfg = config if isinstance(config, Config) else load_config(config)
         slot_opts = cfg.slot_options()
@@ -242,6 +249,9 @@ class DirectoryPipeline:
         self.out = Path(out) if out is not None else None
         self._enrich = enrich
         self._embed = embed
+        # Feature 5: the build-time WalkFilter, re-read by both run() (via the WalkStage it
+        # constructs) and plan() (which builds its own WalkStage on the same filter).
+        self._filter = filter
 
         # Build (or accept) each component. A passed instance is used verbatim; a name is
         # resolved via the registry, forwarding the per-slot config sub-table as kwargs.
@@ -284,7 +294,7 @@ class DirectoryPipeline:
 
         self._cache = StageCache(self.out, enabled=resume)
         self._stages: list[Stage] = [
-            WalkStage(),
+            WalkStage(self._filter),
             cast(
                 "Stage",
                 ResumableParseStage(self._parser, self._names["parser"], self._cache, self.jobs),
@@ -529,7 +539,7 @@ class DirectoryPipeline:
 
         ctx = self._new_context(directory)
         try:
-            WalkStage().run(ctx)
+            WalkStage(self._filter).run(ctx)
             # Report the original input path (the archive, for a ZIP), not the temp extraction dir.
             return BuildPlan(
                 root=Path(ctx.space.manifest.source_root),
@@ -537,12 +547,29 @@ class DirectoryPipeline:
                 components=dict(self._names),
                 embed=self._embed,
                 enrich=self._enrich,
+                skipped=ctx.space.skipped_files_,
             )
         finally:
             cleanup_extracted(ctx.tmp_root)
 
     # ``dry_run`` is a readable alias for ``plan`` so both vocabularies work from the SDK.
     dry_run = plan
+
+    def _resolve_stage_subset(self, requested: Sequence[str]) -> list[Stage]:
+        """Filter ``self._stages`` to ``requested``, preserving canonical pipeline order.
+
+        Feature 1 (selective stage execution): the subset is resolved against the **live** stage
+        list (so plugin/custom stages and ``--no-embed``/``drop`` removals are honored). An unknown
+        name raises :class:`~indx.errors.RegistryError` (exit 3) naming the offender and the live
+        stages — matching the existing ``replace``/``drop`` behavior. The returned list is always
+        in canonical order, never the order names were passed, so output is order-independent.
+        """
+        known = {s.name for s in self._stages}
+        unknown = [n for n in requested if n not in known]
+        if unknown:
+            raise RegistryError(f"unknown stage(s): {unknown}. Known stages: {sorted(known)}")
+        wanted = set(requested)
+        return [s for s in self._stages if s.name in wanted]
 
     def run(
         self,
@@ -551,19 +578,31 @@ class DirectoryPipeline:
         *,
         on_stage: Callable[[str], None] | None = None,
         name: str = "handbook",
+        stages: Sequence[str] | None = None,
     ) -> KnowledgeSpace:
-        """Run every registered stage over ``directory``; return the :class:`KnowledgeSpace`.
+        """Run the registered stages over ``directory``; return the :class:`KnowledgeSpace`.
 
         When ``out`` is given (sdk.md "Execution"), the output layout is sealed to that path via
         the chosen output writer; when ``out`` is ``None`` (or omitted) the space stays in
         memory. ``out`` omitted is distinct from ``out=None`` only so the CLI's
         ``run(dir, on_stage=...)`` path — which writes separately — is not double-written.
+
+        ``stages=None`` (default) runs every registered stage. A subset (e.g.
+        ``("walk", "parse", "chunk")``) runs **only** those stages, in their canonical pipeline
+        order regardless of the order given (Feature 1, selective stage execution). A partial run
+        still produces — and seals — a valid (possibly chunk-less / embedding-less) space. An
+        unknown stage name raises :class:`~indx.errors.RegistryError` (exit 3) **before** any
+        stage runs or any ZIP input is extracted, so nothing is processed or written.
         """
         from indx.utils.zip_input import cleanup_extracted
 
+        # Resolve the stage subset BEFORE touching the input so an unknown stage never extracts a
+        # ZIP, runs a stage, or writes a partial archive.
+        selected = self._stages if stages is None else self._resolve_stage_subset(stages)
+
         ctx = self._new_context(directory)
         try:
-            for stage in self._stages:
+            for stage in selected:
                 if on_stage is not None:
                     on_stage(stage.name)
                 ctx = stage.run(ctx)
@@ -576,6 +615,81 @@ class DirectoryPipeline:
             return space
         finally:
             cleanup_extracted(ctx.tmp_root)
+
+
+class IngestResult:
+    """The artifacts a single-path ingest produced, ready to merge into a space (Feature 3).
+
+    Carries the produced :class:`~indx.core.document.Document` / :class:`~indx.core.chunk.Chunk`
+    / :class:`~indx.core.relation.Relation` slices plus the manifest deltas
+    (``embedding_model``/``embedding_dim``) the embed-pack stage stamped, so an archive-loaded
+    CRUD caller can stamp its own manifest if it was previously unembedded.
+    """
+
+    def __init__(
+        self,
+        *,
+        documents: list[Document],
+        chunks: list[Chunk],
+        relations: list[Relation],
+        embedding_model: str | None,
+        embedding_dim: int | None,
+    ) -> None:
+        self.documents = documents
+        self.chunks = chunks
+        self.relations = relations
+        self.embedding_model = embedding_model
+        self.embedding_dim = embedding_dim
+
+
+def ingest_path(
+    pipeline: DirectoryPipeline,
+    root: Path,
+    rel_paths: list[str] | None = None,
+    *,
+    store: VectorStore | None = None,
+) -> IngestResult:
+    """Run ``pipeline``'s stage stack over ``root`` and return the produced artifacts (Feature 3).
+
+    Reuses the pipeline's configured component stack (parser/embedder/store from the manifest's
+    ``components``). When ``store`` is given, the embed-pack stage upserts into *that* store (the
+    space's rebuilt jsonl store) instead of the pipeline's own — this is how archive-loaded CRUD,
+    which has no live pipeline store, points the embed at the rebuilt store. ``rel_paths``
+    restricts the Walk output to specific root-relative files (CRUD ``add``/``update`` of one
+    file); ``None`` means every walked file (the build path).
+
+    The build path calls this with ``rel_paths=None`` and ``store=None``, producing byte-identical
+    output to running the stages directly, so ``build`` and CRUD share exactly one ingest code
+    path.
+    """
+    from indx.utils.zip_input import cleanup_extracted
+
+    if store is not None:
+        # Point the embed-pack stage at the caller's store (the rebuilt jsonl store). ``use``
+        # rebinds the built-in pack stage to the new store and is a no-op when embed is disabled.
+        pipeline.use(store=store)
+
+    wanted: set[str] | None = None if rel_paths is None else set(rel_paths)
+    ctx = pipeline._new_context(root)
+    try:
+        for stage in pipeline.stages():
+            ctx = stage.run(ctx)
+            if pipeline.strict:
+                _enforce_strict(stage.name, ctx)
+            # Immediately after Walk, narrow the document set to the requested rel-paths so every
+            # later stage (parse/chunk/relate/enrich/pack) operates only on the ingest subset.
+            if stage.name == "walk" and wanted is not None:
+                ctx.space.documents_ = [d for d in ctx.space.documents_ if d.path in wanted]
+        space = ctx.space
+        return IngestResult(
+            documents=list(space.documents_),
+            chunks=list(space.chunks),
+            relations=list(space.relations),
+            embedding_model=space.manifest.embedding_model,
+            embedding_dim=space.manifest.embedding_dim,
+        )
+    finally:
+        cleanup_extracted(ctx.tmp_root)
 
 
 def _enforce_strict(stage_name: str, ctx: SpaceContext) -> None:

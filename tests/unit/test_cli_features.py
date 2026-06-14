@@ -124,7 +124,7 @@ def test_inspect_json_emits_full_space_stats(tmp_path: Path) -> None:
 def test_query_json_matches_searchhit_contract(tmp_path: Path) -> None:
     """`query --json` emits serialized SearchHit[] with chunk/score/neighbors (audit cli §2)."""
     out = _build(tmp_path)
-    result = runner.invoke(app, ["query", str(out), "onboarding handbook", "-k", "2", "--json"])
+    result = runner.invoke(app, ["query", "onboarding handbook", str(out), "-k", "2", "--json"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     assert isinstance(payload, list) and payload
@@ -145,7 +145,7 @@ def test_query_json_matches_searchhit_contract(tmp_path: Path) -> None:
 def test_query_type_filter_runs(tmp_path: Path) -> None:
     """`--type` post-filters hits without error on the offline stack."""
     out = _build(tmp_path)
-    result = runner.invoke(app, ["query", str(out), "security", "-k", "1", "--type", "unknown"])
+    result = runner.invoke(app, ["query", "security", str(out), "-k", "1", "--type", "unknown"])
     assert result.exit_code == 0, result.output
 
 

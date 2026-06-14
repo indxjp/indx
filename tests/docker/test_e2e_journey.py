@@ -21,7 +21,7 @@ JOURNEY = (
     # (docling/openai/qdrant) needs extras + keys, so the air-gapped journey must opt in.
     "indx build /data/airgap_smoke --out /tmp/s.indx --offline && "
     "indx inspect /tmp/s.indx && "
-    "indx query /tmp/s.indx 'sample note about topic'"
+    "indx query 'sample note about topic' /tmp/s.indx"
 )
 
 

@@ -4,9 +4,13 @@
 ARG BASE=indx-core:latest
 FROM ${BASE}
 
+# Extras installed alongside the wheel; compose files override per suite
+# (integration adds the real-backend clients, airgap keeps the default).
+ARG EXTRAS=dev
+
 WORKDIR /app
 COPY dist/*.whl /tmp/
-RUN pip install --no-cache-dir "/tmp/$(ls /tmp | grep '.whl')[dev]"
+RUN pip install --no-cache-dir "/tmp/$(ls /tmp | grep '.whl')[${EXTRAS}]"
 
 COPY tests/ /app/tests/
 COPY pyproject.toml /app/pyproject.toml
