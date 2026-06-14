@@ -118,22 +118,40 @@ def add_command(
             "archive": archive,
             "changed": changed,
             "added": {"docs": added_docs, "chunks": added_chunks},
+            "parse_failures": loaded.parse_failures_,
         }
         console.print_json(json.dumps(payload))
         return
-    # A 0-change add is legitimately idempotent (re-adding an unchanged/already-indexed file), but a
-    # silent green ✓ also masks a typo'd path. Flag it with a distinct warning, keeping exit 0.
-    if not changed:
+    # L3: a no-op add (re-adding an unchanged/already-indexed/empty file) is legitimately
+    # idempotent but a silent green ✓ also masks a typo'd path — AND a re-add can return a
+    # non-empty `changed` list while contributing zero real deltas (+0 docs / +0 chunks), which
+    # a green "added N doc(s) (+0/+0)" would misreport as success. Route to the yellow warning
+    # whenever there are no real deltas (added_docs <= 0 and added_chunks <= 0), regardless of
+    # `changed`, so a no-op reads as intended; a genuine add (positive deltas) still shows green.
+    # Either way keep exit 0.
+    if added_docs <= 0 and added_chunks <= 0:
         console.print(
             f"[yellow]![/yellow] no documents added (already indexed or empty?) → "
             f"[bold]{escape(archive)}[/bold]"
         )
+        _warn_parse_failures(loaded.parse_failures_)
         return
     console.print(
         f"[green]✓[/green] added {len(changed)} doc(s) "
         f"({added_docs:+d} docs · {added_chunks:+d} chunks) → "
         f"[bold]{escape(archive)}[/bold]"
     )
+    # H1: surface any files that reached the parse stage but yielded 0 chunks.
+    _warn_parse_failures(loaded.parse_failures_)
+
+
+def _warn_parse_failures(parse_failures: int) -> None:
+    """Warn (yellow, exit 0) when ``parse_failures`` files were indexed with 0 chunks (H1)."""
+    if parse_failures > 0:
+        console.print(
+            f"[yellow]![/yellow] {parse_failures} file(s) could not be parsed and were "
+            "indexed with 0 chunks (try a richer parser, e.g. indx[docling])"
+        )
 
 
 def update_command(space: Path | None, path: Path, *, json_out: bool = False) -> None:

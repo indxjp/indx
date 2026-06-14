@@ -139,3 +139,52 @@ def test_cli_add_json_summary(tmp_path: Path) -> None:
     payload = json.loads(res.stdout)
     assert payload["added"]["docs"] == 1
     assert len(payload["changed"]) == 1
+    # H1: the JSON payload always carries an integer parse_failures count.
+    assert payload["parse_failures"] == 0
+
+
+def test_cli_readd_zero_delta_warns_not_green(tmp_path: Path) -> None:
+    # L3: re-adding an already-indexed file can return a non-empty `changed` list while
+    # contributing zero real deltas (+0 docs / +0 chunks). That must read as the yellow
+    # "no documents added" warning, NOT a contradictory green "added N doc(s) (+0/+0)".
+    src, out = _build(tmp_path)
+    (src / "extra.txt").write_text("# Extra\n\nzylophant unique token.\n")
+    archive = out / "handbook.indx"
+
+    first = runner.invoke(app, ["add", str(src / "extra.txt"), str(archive)])
+    assert first.exit_code == 0
+    assert "added 1 doc" in first.stdout
+
+    # Second add of the identical, already-indexed file: no real deltas.
+    second = runner.invoke(app, ["add", str(src / "extra.txt"), str(archive)])
+    assert second.exit_code == 0
+    assert "no documents added" in second.stdout
+    assert "✓" not in second.stdout
+    assert "+0 docs" not in second.stdout
+
+
+def test_cli_add_parse_failure_warns_exit_0(tmp_path: Path) -> None:
+    # H1: when a newly-added file reaches the parse stage but yields 0 chunks, add prints a
+    # prominent yellow warning naming the count and keeps exit 0 (non-strict).
+    from indx.cli import crud as crud_module
+
+    src, out = _build(tmp_path)
+    (src / "extra.txt").write_text("# Extra\n\nzylophant unique token.\n")
+    archive = out / "handbook.indx"
+
+    real_add = crud_module.KnowledgeSpace.add
+
+    def add_with_failure(self: object, arg: str) -> object:
+        changed = real_add(self, arg)
+        # Simulate a parse failure surfaced by the ingest pipeline (Agent B contract).
+        self.parse_failures_ = 1  # type: ignore[attr-defined]
+        return changed
+
+    monkey = crud_module.KnowledgeSpace.add
+    try:
+        crud_module.KnowledgeSpace.add = add_with_failure  # type: ignore[method-assign]
+        res = runner.invoke(app, ["add", str(src / "extra.txt"), str(archive)])
+    finally:
+        crud_module.KnowledgeSpace.add = monkey  # type: ignore[method-assign]
+    assert res.exit_code == 0
+    assert "1 file(s) could not be parsed" in res.stdout

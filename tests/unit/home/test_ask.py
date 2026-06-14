@@ -30,8 +30,34 @@ def test_ask_offline_extractive_with_citations(tmp_path: Path) -> None:
     assert answer.llm == "none"
     assert answer.hits
     assert "[1]" in answer.answer
-    assert "Sources:" in answer.answer
+    # M1: the offline answer text must NOT embed its own "Sources:" block — the CLI renders the
+    # source list once from Answer.sources. Embedding it here caused citations to print twice.
+    assert "Sources:" not in answer.answer
     assert any("policy.txt" in s for s in answer.sources)
+
+
+def test_ask_offline_extracts_relevant_sentence_not_raw_chunk(tmp_path: Path) -> None:
+    # M2: the body surfaces a query-relevant extracted sentence, not the whole raw chunk dump.
+    space = _offline_space(tmp_path)
+    answer = space.ask("paid leave manager")
+    assert "leave" in answer.answer.lower()
+
+
+def test_ask_offline_neutralizes_table_pipes(tmp_path: Path) -> None:
+    # M2: pipe-table rows are neutralized so Rich never parses the body as a (blank) table.
+    src = tmp_path / "tbl"
+    src.mkdir()
+    (src / "rows.txt").write_text(
+        "| name | role |\n| alice | manager |\n| bob | analyst |\n",
+        encoding="utf-8",
+    )
+    pipe = DirectoryPipeline(
+        parser="plaintext", llm="none", embedder="hash", store="jsonl", output="jsonl"
+    )
+    space = pipe.run(str(src), str(tmp_path / "out.jsonl"))
+    answer = space.ask("manager")
+    assert "| name | role |" not in answer.answer
+    assert "|" not in answer.answer
 
 
 def test_ask_empty_space() -> None:

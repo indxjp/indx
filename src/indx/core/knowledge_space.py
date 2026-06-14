@@ -96,6 +96,10 @@ class KnowledgeSpace(BaseModel):
     # Never persisted (``exclude=True`` keeps it out of model_dump and therefore out of every
     # archive member) so archive byte-determinism is preserved.
     skipped_files_: int = Field(default=0, exclude=True)
+    # Run telemetry only — number of files that reached the parse stage but produced 0 chunks
+    # (parse-stage "skip" errors this build). Never persisted (``exclude=True``) so archive
+    # byte-determinism is preserved. Surfaced as a yellow warning by build.py / crud.py.
+    parse_failures_: int = Field(default=0, exclude=True)
 
     # Non-serialized runtime state (Feature 2) — never written to the archive.
     # ``_source_path`` is the archive this space was read from (base dir for relative child
@@ -167,8 +171,20 @@ class KnowledgeSpace(BaseModel):
         # ordering IS the global re-rank and the top-k is composite-wide.
         target = self.flatten() if self.manifest.children else self
         m = target.manifest
-        embedder_name = m.components.get("embedder") or m.embedding_model or "hash"
-        embedder = get_embedder(embedder_name)
+        embedder_name = m.components.get("embedder") or m.embedding_model
+        if not embedder_name and self.manifest.children:
+            # Federated composite: the parent manifest is often empty (compose writes
+            # components={} / embedding_model=None) while the children carry the real embedder, so
+            # flatten()'s copied-from-parent manifest names no embedder. Falling through to "hash"
+            # (256-dim) here would query 256-dim against the children's real 1536-dim vectors →
+            # "dimension mismatch". Resolve the embedder from the first child that names one.
+            for child in self.children():
+                cm = child.manifest
+                child_embedder = cm.components.get("embedder") or cm.embedding_model
+                if child_embedder:
+                    embedder_name = child_embedder
+                    break
+        embedder = get_embedder(embedder_name or "hash")
 
         store = get_store("jsonl")
         store.upsert(target.chunks)
@@ -192,9 +208,11 @@ class KnowledgeSpace(BaseModel):
           retrieved chunks, citing source paths. A credential/connection failure surfaces as the
           adapter's typed error (``CredentialsError`` -> exit 3) — never silently downgraded.
         * Otherwise (``llm=none``, the offline default) build a **deterministic extractive
-          answer**: concatenate the top chunks' text in hit order, each suffixed with its 1-based
-          ``[n]`` citation, trailed by a numbered ``Sources`` list of ``hit.source.path``. No
-          model, no network.
+          answer**: for each top hit, split its chunk text into sentences/lines, score them by
+          case-insensitive query-term overlap, and keep the best 1-2 in deterministic order, each
+          suffixed with its 1-based ``[n]`` citation. The cited source paths are NOT embedded in
+          the answer text — the CLI renders them once from :attr:`Answer.sources`. No model, no
+          network.
 
         ``k`` <= 0 returns an empty-answer :class:`Answer` (no crash). An empty space / no hits
         returns ``answer = "No matching content found in the space."``, ``hits=[]``, ``llm="none"``.
@@ -218,7 +236,7 @@ class KnowledgeSpace(BaseModel):
 
         return Answer(
             question=question,
-            answer=self._extractive_answer(hits),
+            answer=self._extractive_answer(question, hits),
             hits=hits,
             llm="none",
         )
@@ -231,8 +249,89 @@ class KnowledgeSpace(BaseModel):
             return collapsed[:budget].rstrip() + "…"
         return collapsed
 
-    def _extractive_answer(self, hits: list[SearchHit]) -> str:
-        """Deterministic offline answer: cited chunk excerpts + a numbered Sources list."""
+    @staticmethod
+    def _tokenize(text: str) -> list[str]:
+        """Lowercase alphanumeric tokens (deterministic, dependency-free)."""
+        token = ""
+        out: list[str] = []
+        for ch in text.lower():
+            if ch.isalnum():
+                token += ch
+            elif token:
+                out.append(token)
+                token = ""
+        if token:
+            out.append(token)
+        return out
+
+    @staticmethod
+    def _split_sentences(text: str) -> list[str]:
+        """Split chunk text into candidate sentences/lines (deterministic, offline).
+
+        Splits first on line breaks, then on sentence-terminating punctuation, so both prose and
+        line-oriented content (e.g. CSV/markdown-table rows) yield separable candidates.
+        """
+        candidates: list[str] = []
+        for line in text.splitlines():
+            piece = ""
+            for ch in line:
+                piece += ch
+                if ch in ".!?":
+                    candidates.append(piece)
+                    piece = ""
+            if piece:
+                candidates.append(piece)
+        return candidates
+
+    @classmethod
+    def _detable(cls, text: str) -> str:
+        """Collapse whitespace and neutralize markdown-table pipe rows.
+
+        Rich renders ``| a | b |`` runs as a (visually collapsing) table; replacing the pipes with
+        a separator keeps the content as plain text so the answer body is never parsed as a table.
+        """
+        collapsed = " ".join(text.split())
+        if "|" in collapsed:
+            parts = [p.strip() for p in collapsed.split("|")]
+            collapsed = " - ".join(p for p in parts if p)
+        return collapsed
+
+    @classmethod
+    def _best_excerpt(cls, question_tokens: set[str], text: str, budget: int = 280) -> str:
+        """Pick the 1-2 most query-relevant sentences/lines from a chunk (deterministic).
+
+        Scores each candidate by case-insensitive query-term overlap and keeps the best one or two
+        in their ORIGINAL order. Falls back to the leading text when nothing overlaps, so a hit
+        always contributes a body. Pipe/table rows are neutralized via :meth:`_detable`.
+        """
+        candidates = cls._split_sentences(text)
+        scored: list[tuple[int, int, str]] = []
+        for i, cand in enumerate(candidates):
+            cleaned = cls._detable(cand)
+            if not cleaned:
+                continue
+            overlap = sum(1 for t in cls._tokenize(cleaned) if t in question_tokens)
+            scored.append((overlap, i, cleaned))
+        if not scored:
+            return cls._chunk_excerpt(text, budget=budget)
+        # Deterministic: best score first, ties broken by original position. Keep top 2, then
+        # re-order the kept ones by original position for natural reading order.
+        ranked = sorted(scored, key=lambda s: (-s[0], s[1]))
+        keep = sorted(ranked[:2], key=lambda s: s[1])
+        # If nothing actually overlapped the query, fall back to a leading excerpt.
+        if all(s[0] == 0 for s in keep):
+            return cls._chunk_excerpt(text, budget=budget)
+        joined = " ".join(s[2] for s in keep)
+        return cls._chunk_excerpt(joined, budget=budget)
+
+    def _extractive_answer(self, question: str, hits: list[SearchHit]) -> str:
+        """Deterministic offline answer: query-relevant cited excerpts (no embedded Sources block).
+
+        The numbered source list is NOT part of the answer text — the CLI renders it once from
+        :attr:`Answer.sources` (otherwise citations show up twice). Each hit contributes its most
+        query-relevant sentence(s)/line(s) with an inline ``[n]`` citation; raw chunk dumps and
+        markdown-table pipe rows are avoided so Rich never collapses the body to a table.
+        """
         # Build the de-duplicated source ordering (first-seen) and a path -> [n] map.
         ordered_sources: list[str] = []
         index_of: dict[str, int] = {}
@@ -242,19 +341,14 @@ class KnowledgeSpace(BaseModel):
                 index_of[path] = len(ordered_sources) + 1
                 ordered_sources.append(path)
 
+        question_tokens = set(self._tokenize(question))
         body_parts: list[str] = []
         for hit in hits:
             path = hit.source.path if hit.source else None
             cite = f" [{index_of[path]}]" if path else ""
-            body_parts.append(f"{self._chunk_excerpt(hit.chunk.text)}{cite}")
-        body = "\n\n".join(body_parts)
-
-        if not ordered_sources:
-            return body
-        sources_block = "\n".join(
-            f"[{i}] {path}" for i, path in enumerate(ordered_sources, start=1)
-        )
-        return f"{body}\n\nSources:\n{sources_block}"
+            excerpt = self._best_excerpt(question_tokens, hit.chunk.text)
+            body_parts.append(f"{excerpt}{cite}")
+        return "\n\n".join(body_parts)
 
     def _ask_llm(self, question: str, hits: list[SearchHit], llm_name: str) -> str:
         """Synthesize an answer with the configured llm, citing the numbered context."""
@@ -506,6 +600,9 @@ class KnowledgeSpace(BaseModel):
         pipe = pipeline if pipeline is not None else self._pipeline_for_manifest()
         store = self._live_store()
         result = ingest_path(pipe, root, rel_paths, store=store)
+        # Surface files that reached the parse stage but produced 0 chunks (H1). IngestResult
+        # carries the count from ingest_path; build.py/crud.py render it as a yellow warning.
+        self.parse_failures_ = result.parse_failures
 
         # Guard BEFORE mutating any row list: if the space already records an embedder, a CRUD-add
         # that embeds with a different width (or a different model) would silently append

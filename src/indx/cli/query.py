@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import typer
 from rich.markup import escape
 from rich.table import Table
 
@@ -26,6 +27,11 @@ def query_command(
     json_out: bool = False,
     no_children: bool = False,
 ) -> None:
+    # ``-k 0`` yields an empty table and ``-k -3`` a nonsensical negative-sliced result; neither
+    # is a meaningful request. Reject k < 1 up front as a usage error (Click BadParameter → exit 2)
+    # before any search, matching the CLI's bad-flag conventions.
+    if k < 1:
+        raise typer.BadParameter("k must be >= 1")
     # F4: an explicit path wins; with no path the home space ($INDX_HOME) is the target.
     loaded = resolve_target(space_path)
     # Feature 2: federate over children unless --no-children. `search` federates internally; the

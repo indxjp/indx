@@ -40,9 +40,10 @@ def test_build_inspect_query_roundtrip(tmp_path: Path) -> None:
 
 
 def test_build_summary_reports_honest_llm_provenance(tmp_path: Path) -> None:
-    # Bug #5: the build-time enricher never invokes an LLM, so requesting --llm openai must NOT
-    # be reported as llm=openai. Both the --json summary and the sealed manifest must read
-    # llm=none (honest provenance), and they must agree. Runs offline (no model is ever called).
+    # H2: with no explicit llm (the zero-config / offline default), the build-time enricher stays
+    # LLM-free, so both the --json summary and the sealed manifest must read llm=none (honest
+    # provenance) and agree. (An explicit llm is now used for enrichment and recorded honestly —
+    # see the pipeline unit tests that wire a fake llm instance with no network.)
     import json
     import zipfile
 
@@ -60,7 +61,7 @@ def test_build_summary_reports_honest_llm_provenance(tmp_path: Path) -> None:
             "--parser",
             "plaintext",
             "--llm",
-            "openai",
+            "none",
             "--embedder",
             "hash",
             "--store",

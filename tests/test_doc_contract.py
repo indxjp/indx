@@ -289,7 +289,9 @@ def test_knowledge_space_ask_offline(corpus: Path, tmp_path: Path) -> None:
     assert answer.question == "leave policy"
     assert answer.llm == "none"  # offline extractive (no llm configured)
     assert answer.hits  # retrieved chunks
-    assert "[1]" in answer.answer and "Sources:" in answer.answer
+    # M1: the offline answer body carries inline [n] citations but no embedded "Sources:" block
+    # (the source list is now surfaced only via answer.sources / the CLI panel, not duplicated).
+    assert "[1]" in answer.answer and "Sources:" not in answer.answer
     assert answer.sources and all(isinstance(s, str) for s in answer.sources)
 
 

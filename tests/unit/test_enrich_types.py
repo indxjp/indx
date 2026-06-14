@@ -210,6 +210,17 @@ def test_topics_nonempty_for_cjk() -> None:
     assert first == second  # deterministic across runs
 
 
+def test_cjk_topics_are_bigrams_not_single_chars() -> None:
+    """L5: a CJK run is segmented into 2-char shingles, not per-ideograph single chars."""
+    doc = Document(id="d1", path="notes.txt")
+    parsed = _parsed(Block(text="プロジェクト計画", order=0))
+    topics = _enrich(doc, parsed, metadata=["topics"]).topics
+    assert topics  # non-empty
+    # Bigram segmentation: tokens are length-2 (e.g. プロ, ロジ, ジェ …), not single ideographs.
+    assert all(len(t) == 2 for t in topics)
+    assert "プロ" in topics
+
+
 def test_topics_ascii_tokenization_unchanged() -> None:
     """English tokenization is byte-for-byte unchanged by the Unicode tokenizer (Bug #9 guard)."""
     doc = Document(id="d1", path="notes.txt")
@@ -219,6 +230,66 @@ def test_topics_ascii_tokenization_unchanged() -> None:
     assert out.topics[0] == "epsilon"
     assert "the" not in out.topics  # 3-char word excluded by the {3,} run after the lead char
     assert "this" not in out.topics  # stopword
+
+
+# --- explicit LLM enrichment (H2) -------------------------------------------------------
+
+
+class _CannedLLM:
+    """Fake llm instance — no network — returning a fixed SUMMARY/TOPICS reply."""
+
+    name = "canned"
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    def complete(self, prompt: str, *, system: str | None = None, **kw: object) -> str:
+        self.prompts.append(prompt)
+        return "SUMMARY: LLM-made summary.\nTOPICS: red, green, blue"
+
+
+def test_llm_drives_summary_and_topics() -> None:
+    """When EnrichStage is given an llm, summary/topics come from it (H2)."""
+    doc = Document(id="d1", path="notes.txt")
+    parsed = _parsed(Block(text="some document body text here", order=0))
+    ctx = _ctx(doc, parsed)
+    fake = _CannedLLM()
+    EnrichStage(metadata=["summary", "topics"], llm=fake).run(ctx)
+    out = ctx.space.documents_[0]
+    assert fake.prompts  # llm was called
+    assert out.summary == "LLM-made summary."
+    assert out.topics == ["red", "green", "blue"]
+
+
+def test_llm_failure_falls_back_to_heuristic() -> None:
+    """A failing llm degrades to the offline heuristic per-doc (no crash)."""
+
+    class _BoomLLM:
+        name = "boom"
+
+        def complete(self, prompt: str, **kw: object) -> str:
+            raise RuntimeError("nope")
+
+    doc = Document(id="d1", path="notes.txt")
+    parsed = _parsed(Block(text="alpha alpha beta gamma delta", order=0))
+    ctx = _ctx(doc, parsed)
+    EnrichStage(metadata=["summary", "topics"], llm=_BoomLLM()).run(ctx)
+    out = ctx.space.documents_[0]
+    assert out.summary  # heuristic summary
+    assert out.topics  # heuristic topics
+    assert out.summary != "LLM-made summary."
+
+
+def test_no_llm_is_byte_identical_to_heuristic() -> None:
+    """With llm=None the output equals the existing heuristic output exactly."""
+    doc = Document(id="d1", path="notes.txt")
+    parsed = _parsed(Block(text="alpha alpha beta gamma delta", order=0))
+    ctx_a = _ctx(doc.model_copy(deep=True), parsed)
+    ctx_b = _ctx(doc.model_copy(deep=True), parsed)
+    EnrichStage(metadata=["summary", "topics"]).run(ctx_a)
+    EnrichStage(metadata=["summary", "topics"], llm=None).run(ctx_b)
+    assert ctx_a.space.documents_[0].summary == ctx_b.space.documents_[0].summary
+    assert ctx_a.space.documents_[0].topics == ctx_b.space.documents_[0].topics
 
 
 def test_default_metadata_populates_all_four() -> None:

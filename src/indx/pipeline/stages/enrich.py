@@ -12,6 +12,12 @@ The configured ``[enrich] metadata`` list (technical-spec §9) selects *which* f
 populated: the documented keys are ``type``, ``topics``, ``tags`` and ``summary`` (``type``
 maps to :attr:`Document.doc_type`). A stage constructed with the default ``metadata`` populates
 all four; passing a subset narrows the work without touching the others.
+
+When an **explicit** build-time LLM is selected (see :class:`DirectoryPipeline`), the stage is
+constructed with ``llm=<instance>`` and produces ``summary`` and ``topics`` from that LLM with a
+deterministic (``temperature=0.0``) prompt; ``type`` and ``tags`` remain heuristic. Any per-document
+LLM failure falls back to the heuristic for that document. With no explicit LLM (the zero-config /
+air-gapped default) the stage is fully offline and byte-identical to the deterministic scaffold.
 """
 
 from __future__ import annotations
@@ -34,10 +40,39 @@ _DEFAULT_METADATA: tuple[str, ...] = (_META_TYPE, _META_TOPICS, _META_TAGS, _MET
 # Tokenizer for term-frequency topics. CJK scripts (Hiragana ぀-ヿ, Katakana, CJK ideographs
 # 㐀-鿿, Hangul 가-힣) are unsegmented and never lowercased by ``str.lower``, so the original
 # ASCII-only ``[a-z][a-z0-9]{3,}`` returned no tokens for Japanese/Chinese/Korean text — leaving
-# ``topics`` empty for any non-Latin document. We additionally emit each CJK character as its own
-# token (the simplest deterministic segmentation for unsegmented scripts) so topics are non-empty,
-# while the Latin branch keeps the exact prior behaviour (so the ASCII corpus golden is unchanged).
-_WORD = re.compile(r"[a-z][a-z0-9]{3,}|[぀-ヿ㐀-鿿가-힣]")
+# ``topics`` empty for any non-Latin document. ``_WORD`` matches either a Latin word (unchanged,
+# so the ASCII corpus golden is identical) **or** a *run* of consecutive CJK characters. Single
+# CJK characters carry little meaning, so :func:`_tokenize` segments each CJK run into overlapping
+# 2-character shingles (bigrams) — the standard dependency-free CJK segmentation heuristic — and
+# falls back to the single character for a length-1 run. This keeps topics deterministic and
+# stdlib-only (no jieba/mecab) while producing word-ish (not per-ideograph) Japanese/Chinese/Korean
+# topics. The Latin branch is matched verbatim and emitted as-is.
+_CJK_RUN = r"[぀-ヿ㐀-鿿가-힣]+"
+_WORD = re.compile(r"[a-z][a-z0-9]{3,}|" + _CJK_RUN)
+_CJK_CHAR = re.compile(r"[぀-ヿ㐀-鿿가-힣]")
+
+
+def _tokenize(text: str) -> list[str]:
+    """Term-frequency tokens for ``text`` (already lowercased by the caller).
+
+    Latin words match the historical ``[a-z][a-z0-9]{3,}`` pattern and are emitted verbatim, so
+    the ASCII corpus golden is byte-identical. A run of consecutive CJK characters is segmented
+    into overlapping 2-char shingles (e.g. ``プロジェクト`` -> ``プロ``, ``ロジ``, ``ジェ`` …); a
+    length-1 run emits the lone character. This is a deterministic, dependency-free approximation
+    of CJK word segmentation.
+    """
+    tokens: list[str] = []
+    for match in _WORD.findall(text):
+        if _CJK_CHAR.match(match):
+            if len(match) == 1:
+                tokens.append(match)
+            else:
+                tokens.extend(match[i : i + 2] for i in range(len(match) - 1))
+        else:
+            tokens.append(match)
+    return tokens
+
+
 _STOP = {
     "this",
     "that",
@@ -137,6 +172,10 @@ _CONTENT_CUES: tuple[tuple[str, str], ...] = (
 # stays O(1) per document regardless of file size (performance rule §14).
 _CUE_SCAN = 2000
 
+# How many leading characters of the document text are sent to the LLM enricher. Bounded so a
+# huge file does not blow the prompt budget; the lead is enough for a 1-2 sentence summary.
+_LLM_LEAD_CHARS = 4000
+
 # Types whose role is inherent (extension/lineage derived) and should not be overridden by a
 # weaker content cue.
 _STRONG_TYPES = frozenset(_LINEAGE_TYPE.values()) | {
@@ -157,6 +196,7 @@ class EnrichStage:
         max_topics: int = 5,
         *,
         metadata: Sequence[str] | None = None,
+        llm: object | None = None,
     ) -> None:
         """Configure the scaffold enricher.
 
@@ -166,8 +206,16 @@ class EnrichStage:
                 to all scaffold-supported keys (``type``, ``topics``, ``tags``, ``summary``).
                 Unknown keys are ignored so a config that names a future LLM-only field does not
                 error here.
+            llm: An optional LLM instance (exposing ``.complete(prompt, system=..., max_tokens=...,
+                temperature=...) -> str``). When provided, ``summary`` and ``topics`` are produced
+                by the LLM with a deterministic (``temperature=0.0``) prompt instead of the offline
+                heuristics; ``type`` and ``tags`` stay heuristic. Any per-document LLM failure
+                falls back to the heuristic for that document, so one bad doc or a creds error
+                never aborts the build. When ``None`` (the zero-config / air-gapped default),
+                behaviour matches the deterministic offline scaffold byte-for-byte (golden kept).
         """
         self.max_topics = max_topics
+        self._llm = llm
         selected = _DEFAULT_METADATA if metadata is None else tuple(metadata)
         self._want_type = _META_TYPE in selected
         self._want_topics = _META_TOPICS in selected
@@ -192,10 +240,18 @@ class EnrichStage:
             doc_type = self._detect_type(doc.path, doc.lineage, parsed)
             if self._want_type:
                 doc.doc_type = doc_type
+            # When an explicit LLM is wired in, ask it once per document for the summary + topics
+            # (a single deterministic prompt yields both). ``None`` means stay offline/heuristic.
+            llm_summary: str | None = None
+            llm_topics: list[str] | None = None
+            if self._llm is not None and (self._want_summary or self._want_topics):
+                llm_summary, llm_topics = self._llm_enrich(parsed, doc_type)
             if self._want_topics:
-                doc.topics = self._topics(text)
+                doc.topics = llm_topics if llm_topics is not None else self._topics(text)
             if self._want_summary:
-                doc.summary = self._summary(parsed, doc_type)
+                doc.summary = (
+                    llm_summary if llm_summary is not None else self._summary(parsed, doc_type)
+                )
             if self._want_tags:
                 # Tags are type-aware: they always carry the detected role, then folder-lineage
                 # cues, so downstream filters can pivot on either without re-deriving them.
@@ -240,7 +296,7 @@ class EnrichStage:
         return ext_type or "unknown"
 
     def _topics(self, text: str) -> list[str]:
-        counts = Counter(w for w in _WORD.findall(text.lower()) if w not in _STOP)
+        counts = Counter(w for w in _tokenize(text.lower()) if w not in _STOP)
         # deterministic: sort by (-count, word)
         ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
         return [w for w, _ in ranked[: self.max_topics]]
@@ -286,6 +342,57 @@ class EnrichStage:
                 return combined[:limit]
             return body[:limit]
         return " ".join(parsed.text.split())[:limit]
+
+    def _llm_enrich(self, parsed: ParsedDoc, doc_type: str) -> tuple[str | None, list[str] | None]:
+        """Ask the wired LLM for a summary + topic list from the document's lead text.
+
+        Returns ``(summary, topics)`` where each element is ``None`` if not wanted or if the LLM
+        call/parse failed (the caller then falls back to the heuristic for that field). Both the
+        call and the parse are wrapped so any failure — a creds/network error, a malformed reply,
+        an unexpected shape — degrades to the offline heuristic instead of aborting the build.
+        """
+        llm = self._llm
+        if llm is None:
+            return None, None
+        lead = " ".join(parsed.text.split())[:_LLM_LEAD_CHARS]
+        if not lead:
+            return None, None
+        system = (
+            "You summarize documents for a search index. Reply with EXACTLY two lines and nothing "
+            "else.\nLine 1: SUMMARY: <a 1-2 sentence neutral summary>\n"
+            "Line 2: TOPICS: <a short comma-separated list of key topics>"
+        )
+        prompt = f"Document type: {doc_type}\n\nDocument text:\n{lead}"
+        try:
+            complete = llm.complete  # type: ignore[attr-defined]
+            reply = str(complete(prompt, system=system, max_tokens=256, temperature=0.0))
+        except Exception:  # creds/network/adapter failure → heuristic fallback (do not crash)
+            return None, None
+        return self._parse_llm_reply(reply)
+
+    def _parse_llm_reply(self, reply: str) -> tuple[str | None, list[str] | None]:
+        """Parse the ``SUMMARY:`` / ``TOPICS:`` lines from the LLM reply (resilient to noise)."""
+        summary: str | None = None
+        topics: list[str] | None = None
+        for raw in reply.splitlines():
+            line = raw.strip()
+            lower = line.lower()
+            if lower.startswith("summary:"):
+                value = line.split(":", 1)[1].strip()
+                if value:
+                    summary = value
+            elif lower.startswith("topics:"):
+                value = line.split(":", 1)[1].strip()
+                parsed_topics = [t.strip() for t in value.split(",") if t.strip()]
+                if parsed_topics:
+                    topics = parsed_topics[: self.max_topics]
+        if self._want_summary and summary is None and self._want_topics and topics is None:
+            # Nothing usable parsed out — let both fields fall back to the heuristic.
+            return None, None
+        return (
+            (summary if self._want_summary else None),
+            (topics if self._want_topics else None),
+        )
 
 
 def _ext_type(path: str) -> str:

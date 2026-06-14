@@ -230,23 +230,28 @@ class DirectoryPipeline:
         # Resolve each slot to (name, optional pre-built instance). Names are recorded in the
         # manifest for provenance and used to resolve registry-backed slots lazily.
         p_name, p_inst = _slot_name(parser, slot="parser", config_value=cfg.parser.engine)
-        l_name, _ = _slot_name(llm, slot="llm", config_value=cfg.enrich.llm)
+        l_name, l_inst = _slot_name(llm, slot="llm", config_value=cfg.enrich.llm)
         v_name, _ = _slot_name(vlm, slot="vlm", config_value=cfg.enrich.vlm)
         e_name, e_inst = _slot_name(embedder, slot="embedder", config_value=cfg.embed.model)
         s_name, s_inst = _slot_name(store, slot="store", config_value=cfg.store.backend)
         o_name, o_inst = _slot_name(output, slot="output", config_value=cfg.output.format)
 
-        # The build-time Enrich stage is the deterministic, LLM-free scaffold (enrich.py docstring):
-        # no llm/vlm is ever resolved or called on the build path. So the recorded build provenance
-        # for these two slots must read ``none`` rather than the resolved selector — stamping
-        # ``llm=openai`` into the manifest/components would falsely claim an LLM ran. (``ask``
-        # resolves its answering llm from its own path and is unaffected.) The names are still
-        # resolved above so a future LLM enricher can consume them, but they are not recorded as
-        # build provenance here.
-        del l_name, v_name  # resolved but unused for build provenance (build enrichment is local)
+        # H2 — build-time LLM enrichment, but ONLY on an EXPLICIT selection. The vlm provenance
+        # stays ``none`` (no build-time VLM enricher). The llm is used for enrichment iff the user
+        # *explicitly* asked for one: either the ``llm=`` constructor arg was provided (not None),
+        # or ``[enrich] llm`` was set to a real value in config. It must NOT be resolved/called on
+        # the zero-config / air-gapped default path (``cfg.enrich.llm`` defaults to DEFAULT_LLM),
+        # or the offline promise — and the whole test suite — breaks. So we never fall back to the
+        # documented default for enrichment: an unset / "" / "none" llm means "no LLM enrichment".
+        del v_name  # resolved but unused for build provenance (no build-time VLM enricher)
+        self._enrich_llm = self._resolve_enrich_llm(
+            arg=llm, l_name=l_name, l_inst=l_inst, cfg_llm=cfg.enrich.llm
+        )
         self._names = {
             "parser": p_name or _DEFAULTS["parser"],
-            "llm": "none",
+            # Honest provenance: the real llm name only when an explicit LLM enriches this build;
+            # otherwise ``none`` (the deterministic scaffold ran, claiming an LLM would be a lie).
+            "llm": self._enrich_llm[0] if self._enrich_llm is not None else "none",
             "vlm": "none",
             "embedder": e_name or _DEFAULTS["embedder"],
             "store": s_name or _DEFAULTS["store"],
@@ -318,7 +323,16 @@ class DirectoryPipeline:
             ),
             ChunkStage(),
             RelateStage(),
-            *([EnrichStage(metadata=self._enrich_metadata)] if enrich else []),
+            *(
+                [
+                    EnrichStage(
+                        metadata=self._enrich_metadata,
+                        llm=(self._enrich_llm[1] if self._enrich_llm is not None else None),
+                    )
+                ]
+                if enrich
+                else []
+            ),
             *(
                 [
                     cast(
@@ -338,6 +352,47 @@ class DirectoryPipeline:
         # Merge third-party stages advertised under ``[project.entry-points.'indx.stages']``
         # (file-architecture §6); appended by default so built-ins keep canonical order.
         self._merge_plugin_stages()
+
+    @staticmethod
+    def _resolve_enrich_llm(
+        *,
+        arg: object | str | None,
+        l_name: str | None,
+        l_inst: object | None,
+        cfg_llm: str,
+    ) -> tuple[str, object] | None:
+        """Resolve the build-time enrichment LLM, or ``None`` when none is explicitly selected.
+
+        An LLM enriches the build ONLY on an explicit selection (H2):
+
+        * the ``llm=`` constructor arg was provided (not ``None``) — an instance is used directly,
+          a name string is resolved via the registry; or
+        * ``[enrich] llm`` was set in config to a real value (i.e. something other than the
+          documented default :data:`DEFAULT_LLM`, ``""`` or ``"none"``).
+
+        We deliberately never fall back to :data:`DEFAULT_LLM` here: the zero-config / air-gapped
+        default path must stay fully offline and deterministic. Returns ``(name, instance)`` ready
+        to hand to :class:`EnrichStage`.
+        """
+        # 1. Explicit constructor instance — use it verbatim.
+        if arg is not None and not isinstance(arg, str):
+            name = l_name or getattr(arg, "name", None) or "llm"
+            return name, arg
+        # 2. Explicit constructor name string — resolve via the registry.
+        if isinstance(arg, str):
+            selected = arg.strip()
+            if selected and selected.lower() != "none":
+                from indx.registry import get_llm
+
+                return selected, get_llm(selected)
+            return None
+        # 3. No constructor arg: honour an explicit config selection only (not the default).
+        configured = (cfg_llm or "").strip()
+        if configured and configured.lower() != "none" and configured != DEFAULT_LLM:
+            from indx.registry import get_llm
+
+            return configured, get_llm(configured)
+        return None
 
     def _merge_plugin_stages(self) -> None:
         """Append any discovered third-party stages whose name is not already present."""
@@ -634,9 +689,12 @@ class DirectoryPipeline:
         """Run the registered stages over ``directory``; return the :class:`KnowledgeSpace`.
 
         When ``out`` is given (sdk.md "Execution"), the output layout is sealed to that path via
-        the chosen output writer; when ``out`` is ``None`` (or omitted) the space stays in
-        memory. ``out`` omitted is distinct from ``out=None`` only so the CLI's
-        ``run(dir, on_stage=...)`` path — which writes separately — is not double-written.
+        the chosen output writer. When ``out`` is **omitted** and the pipeline was constructed with
+        ``out=`` (the default output destination), the space is sealed to that constructor path
+        instead (L1). When ``out`` is ``None`` (explicitly disabled) — or omitted with no
+        constructor ``out=`` — the space stays in memory. ``out`` omitted is distinct from
+        ``out=None`` so the CLI's ``run(dir, on_stage=...)`` path (which does not set a constructor
+        ``out=`` and writes separately) is never double-written.
 
         ``stages=None`` (default) runs every registered stage. A subset (e.g.
         ``("walk", "parse", "chunk")``) runs **only** those stages, in their canonical pipeline
@@ -660,9 +718,16 @@ class DirectoryPipeline:
                 if self.strict:
                     _enforce_strict(stage.name, ctx)
             space = ctx.space
+            # H1: surface parse-stage skips (files indexed with 0 chunks) on the space so the CLI
+            # can warn. Mirrors the existing ``skipped_files_`` (walk) provenance field.
+            space.parse_failures_ = _parse_failure_count(ctx)
 
-            if out is not _UNSET and out is not None:
-                self._writer().write(space, Path(out), name=name)
+            # L1: ``run()``'s own ``out`` wins; when it is omitted (the _UNSET sentinel) fall back
+            # to the constructor ``out=`` as the default output destination. ``out=None`` (and an
+            # omitted ``out`` with no constructor default) stays in memory.
+            destination = self.out if out is _UNSET else out
+            if destination is not None:
+                self._writer().write(space, Path(destination), name=name)
             return space
         finally:
             cleanup_extracted(ctx.tmp_root)
@@ -675,6 +740,10 @@ class IngestResult:
     / :class:`~indx.core.relation.Relation` slices plus the manifest deltas
     (``embedding_model``/``embedding_dim``) the embed-pack stage stamped, so an archive-loaded
     CRUD caller can stamp its own manifest if it was previously unembedded.
+
+    ``parse_failures`` is the count of files the parse stage skipped (recorded as ``kind="skip"``
+    parse errors on the context). A CRUD caller surfaces it as a prominent warning so files that
+    were indexed with zero chunks are not silently lost (H1).
     """
 
     def __init__(
@@ -685,12 +754,14 @@ class IngestResult:
         relations: list[Relation],
         embedding_model: str | None,
         embedding_dim: int | None,
+        parse_failures: int = 0,
     ) -> None:
         self.documents = documents
         self.chunks = chunks
         self.relations = relations
         self.embedding_model = embedding_model
         self.embedding_dim = embedding_dim
+        self.parse_failures = parse_failures
 
 
 def ingest_path(
@@ -738,9 +809,15 @@ def ingest_path(
             relations=list(space.relations),
             embedding_model=space.manifest.embedding_model,
             embedding_dim=space.manifest.embedding_dim,
+            parse_failures=_parse_failure_count(ctx),
         )
     finally:
         cleanup_extracted(ctx.tmp_root)
+
+
+def _parse_failure_count(ctx: SpaceContext) -> int:
+    """Count parse-stage per-item skips on the context (files indexed with 0 chunks — H1)."""
+    return len([e for e in ctx.errors if e.kind == "skip" and (e.stage or "") == "parse"])
 
 
 def _enforce_strict(stage_name: str, ctx: SpaceContext) -> None:
