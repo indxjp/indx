@@ -5,6 +5,8 @@ Public SDK surface. The CLI is this same surface with handles (CLI⇄SDK parity)
 
 from indx._version import __version__
 from indx.core import (
+    Answer,
+    ChildRef,
     Chunk,
     Document,
     KnowledgeSpace,
@@ -16,12 +18,15 @@ from indx.core import (
     SpaceContext,
     SpaceStats,
 )
-from indx.pipeline import DirectoryPipeline
+from indx.pipeline import DirectoryPipeline, WalkFilter
 from indx.store.base import SearchHit
 
 __all__ = [
     "__version__",
     "DirectoryPipeline",
+    "WalkFilter",
+    "Answer",
+    "ChildRef",
     "KnowledgeSpace",
     "Manifest",
     "Document",

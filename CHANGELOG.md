@@ -9,7 +9,62 @@ major/minor/patch mean for the CLI, the SDK, and the `.indx` artifact format.
 
 ## [Unreleased]
 
-Nothing yet.
+## [0.0.4] — 2026-06-14
+
+Five additive features for working with knowledge spaces beyond the initial all-or-nothing
+build. Everything ships on the zero-dependency offline core stack
+(`plaintext / none / hash / jsonl / .indx`) — no extras required.
+
+### Added
+
+- **Granular per-stage load / import.** Run and persist a prefix, suffix, or subset of the
+  pipeline instead of always all six stages: `build --stages parse,chunk,relate`,
+  `--through <stage>`, `--from <stage>` (and `DirectoryPipeline.run(stages=…)`). A partial run
+  still seals a valid (possibly chunk-less / embedding-less) archive. Load only the members you
+  ask for: `read_archive(src, members=…)`, `KnowledgeSpace.load(members=…)` / `.load_part(…)`,
+  and `indx inspect <archive> --part documents|chunks|relations|manifest [--json]`. Checksum and
+  zip-bomb guards still cover every member that is actually read.
+- **indx of indx (composite spaces).** A `.indx` manifest can now reference other `.indx`
+  archives via the additive `Manifest.children` list (`ChildRef = {name, ref, sha256?}`);
+  `archive` `SCHEMA_VERSION` is bumped to `"2"` and the reader stays backward-tolerant of `"1"`.
+  `indx compose <parent.indx> --add child.indx` (+ SDK `add_child`/`remove_child`) edits the
+  parent only; `inspect`/`query`/`stats` federate across children (`children()`, `flatten()` —
+  namespaced ids, dedup, cycle-guarded). `--no-children` limits a command to the parent.
+- **CRUD over indx documents.** Append, re-ingest, or delete documents in an existing `.indx`
+  incrementally — `KnowledgeSpace.add()` / `.update()` / `.remove()` and `indx add` / `indx update`
+  / `indx rm` — keeping relations consistent, re-stamping chunk sources, upserting/deleting
+  vectors, and resealing deterministically. Works on archive-loaded spaces with no live store.
+- **Home-directory mode (one permanent DB).** A persistent personal knowledge base under
+  `~/.indx/` (override `$INDX_HOME`). `query` / `ask` / `add` / `rm` / `update` / `inspect`
+  default to it when no path is given. New `indx ask` command (+ `KnowledgeSpace.ask` / the
+  `Answer` model): retrieve top-k and either LLM-synthesize or return a deterministic extractive
+  answer with citations, fully offline. New `indx home path` / `home stats` / `home reset`.
+- **Conditional / filtered directory import.** Choose which files enter the space at build time
+  by glob, extension, size, depth, count, and filename via a new `[walk]` config section and the
+  `WalkFilter` SDK model, with matching `build` flags: `--include` / `--exclude` / `--ext` /
+  `--name-glob` (repeatable), `--min-size` / `--max-size` (with `kb`/`mb`/`gb` suffixes),
+  `--max-files`, `--max-depth`. CLI overrides config per field; `--dry-run` previews the
+  selection (`N files, M skipped by filter`).
+
+### Changed
+
+- **Breaking (CLI):** `query` / `ask` take their query text **first** and the `space` argument
+  **second** (now optional, so it can default to the home space): `indx query "text" [space]`.
+  The previous `indx query <space> "text"` order no longer works — swap the two arguments.
+  (Pre-1.0; surfaced here because it changes an existing invocation.)
+- `.indx` archives are written at `schema_version "2"`; the reader loads both `"1"` and `"2"`
+  (`SUPPORTED_SCHEMA_VERSIONS`). The `children` manifest field is additive and optional.
+- New public SDK symbols: `Answer`, `ChildRef`, `WalkFilter` (in `indx.__all__`).
+
+### Fixed
+
+- A single-file `indx add` to the home space no longer persists a dangling temporary
+  directory in the sealed manifest's `source_root`; it is restored to `$INDX_HOME`.
+- `KnowledgeSpace.remove()` now deletes the removed chunks' vectors from the rebuilt
+  store (previously a no-op because the rows were dropped first).
+- A fresh `build` whose selected stage subset omits the leading `walk` stage (e.g.
+  `--from chunk`) now warns on stderr that it will index no documents, instead of
+  silently sealing an empty archive.
 
 ## [0.0.3] — 2026-06-09
 

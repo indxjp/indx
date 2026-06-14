@@ -8,6 +8,7 @@ from indx.config.schema import (
     OutputConfig,
     ParserConfig,
     StoreConfig,
+    WalkConfig,
 )
 
 __all__ = [
@@ -17,6 +18,7 @@ __all__ = [
     "EmbedConfig",
     "StoreConfig",
     "OutputConfig",
+    "WalkConfig",
     "find_config",
     "load_config",
 ]

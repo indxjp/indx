@@ -12,9 +12,12 @@ pipeline can forward them as kwargs to the adapter constructor (configuration re
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from indx.pipeline.filters import WalkFilter
 
 from indx.config.defaults import (
     DEFAULT_EMBEDDER,
@@ -145,6 +148,35 @@ class OutputConfig(_SlotConfig):
     format: str = DEFAULT_FORMAT
 
 
+class WalkConfig(BaseModel):
+    """The ``[walk]`` section of indx.toml — the build-time file filter (Feature 5).
+
+    Mirrors WalkFilter's fields; resolved into a WalkFilter by the build command. ``extra``
+    is forbidden so a typo (``[walk] exclud = ...``) is a ConfigError, not a silent no-op.
+    ``min_size``/``max_size`` are typed ``int | str | None`` so a TOML ``max_size = "2mb"``
+    string survives validation here and the suffix is parsed once, centrally, by WalkFilter.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    include: list[str] = Field(default_factory=list)
+    exclude: list[str] = Field(default_factory=list)
+    ext: list[str] = Field(default_factory=list)
+    name: list[str] = Field(default_factory=list)
+    min_size: int | str | None = None
+    max_size: int | str | None = None
+    max_files: int | None = None
+    max_depth: int | None = None
+
+    def to_filter(self) -> WalkFilter:
+        """Build a WalkFilter from this section (size suffix parsing happens in WalkFilter)."""
+        # Local import avoids a schema→pipeline import cycle (the safe rule this repo follows
+        # for cross-layer references); WalkFilter itself imports only indx.errors.
+        from indx.pipeline.filters import WalkFilter
+
+        return WalkFilter(**self.model_dump())
+
+
 class Config(BaseModel):
     """The fully-resolved configuration the pipeline runs from."""
 
@@ -155,6 +187,7 @@ class Config(BaseModel):
     embed: EmbedConfig = Field(default_factory=EmbedConfig)
     store: StoreConfig = Field(default_factory=StoreConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
+    walk: WalkConfig = Field(default_factory=WalkConfig)
 
     def slot_options(self) -> dict[str, dict[str, Any]]:
         """Per-slot adapter kwargs, keyed by slot name (``parser``/``store``/...).

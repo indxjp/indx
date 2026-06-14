@@ -17,6 +17,10 @@ jobs:
           python-version: "3.12"
       - run: pip install -e ".[dev]" build
       - run: python -m build --wheel --outdir dist
+      # Dockerfile.app layers the wheel on top of indx-core:latest, which only exists
+      # locally — build it first or compose tries to pull it from Docker Hub.
+      - name: Build the indx-core base image
+        run: docker build -f docker/Dockerfile.core -t indx-core:latest .
       - name: Integration suite (qdrant / postgres / ollama)
         run: |
           docker compose -f docker/compose.integration.yml up \

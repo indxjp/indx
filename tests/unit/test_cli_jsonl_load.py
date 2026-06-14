@@ -65,7 +65,7 @@ def test_inspect_command_on_jsonl_dir(tmp_path: Path) -> None:
 
 def test_query_command_on_jsonl_dir(tmp_path: Path) -> None:
     out = _build_jsonl_dir(tmp_path)
-    result = runner.invoke(app, ["query", str(out), "onboarding handbook", "-k", "2"])
+    result = runner.invoke(app, ["query", "onboarding handbook", str(out), "-k", "2"])
     assert result.exit_code == 0, result.output
     assert "query:" in result.stdout
 

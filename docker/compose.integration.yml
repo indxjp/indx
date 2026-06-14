@@ -35,6 +35,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.app
+      args:
+        EXTRAS: dev,qdrant  # the store contract test drives a real Qdrant
     environment:
       INDX_QDRANT_URL: http://qdrant:6333
       INDX_PG_DSN: postgresql://postgres:indx@postgres:5432/indx
