@@ -589,11 +589,17 @@ def build_router() -> APIRouter:
                     item = await channel.get()
                     if item is None:
                         break
+                    # Yield the just-dequeued frame BEFORE probing for disconnect. Starlette's
+                    # ``is_disconnected`` can latch true around end-of-body (or on a spurious
+                    # ``http.disconnect``); checking it first would silently drop an
+                    # already-produced terminal ``done``/``error`` frame the worker emitted.
+                    # Emitting first guarantees every frame reaches the client; the probe still
+                    # halts the build at the next boundary on a real disconnect.
+                    event, data = item
+                    yield _sse(event, data)
                     if await request.is_disconnected():
                         stop.set()
                         break
-                    event, data = item
-                    yield _sse(event, data)
             finally:
                 # On any exit (disconnect, normal end, GeneratorExit) ask the worker to bail at the
                 # next stage boundary so it can't keep doing real work after the stream is gone.
@@ -697,7 +703,20 @@ def build_router() -> APIRouter:
             kept.append(hit)
             if len(kept) >= k:
                 break
-        return QueryResponse(hits=kept)
+        # The UI only renders text/score/source, so strip the dense embedding vector from each
+        # hit's chunk (and every neighbor chunk) before returning — it is a per-hit ``list[float]``
+        # of the embedder width (e.g. 256 floats) that would otherwise inline as dead payload. Copy
+        # at the app boundary so the shared core ``Chunk``/``SearchHit`` models are left untouched.
+        stripped = [
+            hit.model_copy(
+                update={
+                    "chunk": hit.chunk.model_copy(update={"embedding": None}),
+                    "neighbors": [n.model_copy(update={"embedding": None}) for n in hit.neighbors],
+                }
+            )
+            for hit in kept
+        ]
+        return QueryResponse(hits=stripped)
 
     # ----------------------------------------------------------------- agent
     # Surfacing ``indx.agent`` (docs/app-backend-gaps.md §agent). Constructing the connector and
@@ -782,6 +801,14 @@ def build_router() -> APIRouter:
         if not base.is_dir():
             raise HTTPException(status_code=400, detail=f"not a directory: {base}")
         base = base.resolve()
+        # Containment guard (same allow-set as ``/api/export``): the directory picker may only walk
+        # the server's working-directory tree or an app-owned ``indx-app-*`` temp dir. Without this
+        # a caller could enumerate any readable directory (``?path=/etc``); reject with 400 to match
+        # export's traversal path rather than leak an arbitrary listing.
+        if not _is_exportable_location(base):
+            raise HTTPException(
+                status_code=400, detail=f"refusing to browse outside the working directory: {base}"
+            )
         entries: list[BrowseEntry] = []
         try:
             children = sorted(base.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))

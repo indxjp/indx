@@ -15,6 +15,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+import typer
 from rich.markup import escape
 
 from indx.cli._render import console, resolve_archive, resolve_target
@@ -120,6 +121,14 @@ def add_command(
         }
         console.print_json(json.dumps(payload))
         return
+    # A 0-change add is legitimately idempotent (re-adding an unchanged/already-indexed file), but a
+    # silent green ✓ also masks a typo'd path. Flag it with a distinct warning, keeping exit 0.
+    if not changed:
+        console.print(
+            f"[yellow]![/yellow] no documents added (already indexed or empty?) → "
+            f"[bold]{escape(archive)}[/bold]"
+        )
+        return
     console.print(
         f"[green]✓[/green] added {len(changed)} doc(s) "
         f"({added_docs:+d} docs · {added_chunks:+d} chunks) → "
@@ -147,6 +156,14 @@ def update_command(space: Path | None, path: Path, *, json_out: bool = False) ->
         }
         console.print_json(json.dumps(payload))
         return
+    # A 0-change update is legitimate (the file was unchanged since the last index) but can also
+    # mean a typo'd path; flag it distinctly, keeping exit 0.
+    if not changed:
+        console.print(
+            f"[yellow]![/yellow] no documents changed (unchanged or not found?) → "
+            f"[bold]{escape(archive)}[/bold]"
+        )
+        return
     console.print(
         f"[green]✓[/green] updated {len(changed)} doc(s) "
         f"({delta_docs:+d} docs · {delta_chunks:+d} chunks) → "
@@ -172,6 +189,15 @@ def remove_command(space: Path | None, target: str, *, json_out: bool = False) -
         }
         console.print_json(json.dumps(payload))
         return
+    # Unlike add/update, a 0-match rm almost always means a wrong id/path — it can never be a
+    # legitimate no-op the way re-adding an unchanged file is. Warn AND exit non-zero so a typo is
+    # not a silent success (the JSON branch above is untouched, so scripted consumers are stable).
+    if not removed:
+        console.print(
+            f"[yellow]![/yellow] no documents matched {escape(target)} — nothing removed from "
+            f"[bold]{escape(archive)}[/bold]"
+        )
+        raise typer.Exit(1)
     console.print(
         f"[green]✓[/green] removed {len(removed)} doc(s) "
         f"({removed_docs} docs · {removed_chunks} chunks) → "

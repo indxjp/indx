@@ -48,6 +48,25 @@ def test_compose_adds_children(tmp_path: Path) -> None:
     assert b.read_bytes() == b_bytes
 
 
+def test_compose_creates_absent_parent(tmp_path: Path) -> None:
+    # Bug #8: `compose ./all.indx --add ...` is the federation CREATION step — an absent parent
+    # path must be created, not rejected at Typer arg validation.
+    a = tmp_path / "a.indx"
+    b = tmp_path / "b.indx"
+    _build(tmp_path / "ca", [("a.txt", "alpha onboarding apple")], a)
+    _build(tmp_path / "cb", [("b.txt", "beta payroll banana")], b)
+    parent = tmp_path / "all.indx"
+    assert not parent.exists()
+    result = runner.invoke(app, ["compose", str(parent), "--add", str(a), "--add", str(b)])
+    assert result.exit_code == 0, result.output
+    assert parent.is_file()
+    reloaded = read_archive(parent)
+    assert [c.name for c in reloaded.manifest.children] == ["a", "b"]
+    # A freshly-created parent has no rows of its own; federated inspect lists both children.
+    inspected = runner.invoke(app, ["inspect", str(parent)])
+    assert inspected.exit_code == 0, inspected.output
+
+
 def test_compose_no_args_is_usage_error(tmp_path: Path) -> None:
     p, _a, _b = _scene(tmp_path)
     result = runner.invoke(app, ["compose", str(p)])
@@ -140,3 +159,50 @@ def test_inspect_missing_child_renders_state_query_fails(tmp_path: Path) -> None
     # but a federated query MUST read the child and therefore fail.
     q = runner.invoke(app, ["query", "anything", str(p)])
     assert q.exit_code == 4, q.output
+
+
+def test_add_child_in_memory_relative_ref_does_not_pin(tmp_path: Path) -> None:
+    """Bug #S13: in-memory space + relative ref + auto_pin must NOT pin a cwd-resolved digest.
+
+    ``children()`` resolves a relative ref against the (eventual) archive dir, not the cwd the pin
+    was taken from. Pinning ``cwd/ref`` records a digest for a path resolve never uses, producing a
+    spurious "child checksum mismatch" after save+reload. The fix skips the pin in that case.
+    """
+    # Real child lives in tmp_path; a DECOY child.indx sits in the cwd to prove the cwd is ignored.
+    _build(tmp_path / "cc", [("c.txt", "real child gamma")], tmp_path / "child.indx")
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    _build(cwd / "decoy", [("x.txt", "decoy delta")], cwd / "child.indx")
+
+    import os
+
+    prev = os.getcwd()
+    os.chdir(cwd)
+    try:
+        space = KnowledgeSpace()  # in-memory: _source_path is None
+        ref = space.add_child("child", "child.indx", auto_pin=True)
+        assert ref.sha256 is None  # no bogus cwd pin
+    finally:
+        os.chdir(prev)
+
+    # Save next to the REAL child and confirm children() resolves without a checksum mismatch.
+    parent_path = tmp_path / "parent.indx"
+    space.save(str(parent_path))
+    reloaded = KnowledgeSpace.load(str(parent_path))
+    kids = reloaded.children()
+    assert [k for k in kids]  # resolved without ArchiveError
+
+
+def test_add_child_absolute_ref_pins_and_resolves(tmp_path: Path) -> None:
+    """An absolute ref still auto-pins (pin path == resolve path) and resolves cleanly."""
+    from indx.archive import format as fmt
+
+    child = tmp_path / "child.indx"
+    _build(tmp_path / "cc", [("c.txt", "real child gamma")], child)
+
+    space = KnowledgeSpace()
+    ref = space.add_child("child", str(child), auto_pin=True)
+    assert ref.sha256 == fmt.file_sha256(child)
+    parent_path = tmp_path / "parent.indx"
+    space.save(str(parent_path))
+    assert KnowledgeSpace.load(str(parent_path)).children()

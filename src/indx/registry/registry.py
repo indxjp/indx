@@ -9,6 +9,7 @@ is actually selected (file-architecture §5). Names may carry a ``:model`` suffi
 from __future__ import annotations
 
 import importlib
+import inspect
 from typing import Any, cast
 
 from indx.errors import MissingExtraError, RegistryError
@@ -56,12 +57,37 @@ def _resolve(slot: str, name: str) -> type:
     raise RegistryError(f"unknown {slot} '{name}'. Known {slot}s: {known}")
 
 
+def _accepts_model(cls: type) -> bool:
+    """Whether ``cls.__init__`` can take a ``model=`` kwarg.
+
+    True if the constructor declares an explicit ``model`` parameter or a ``**kwargs``
+    catch-all. Builtins (e.g. ``object.__init__``) have no introspectable signature; treat
+    those as accepting it so the call proceeds and any genuine mismatch still surfaces.
+    """
+    try:
+        params = inspect.signature(cls.__init__).parameters  # type: ignore[misc]
+    except (ValueError, TypeError):
+        return True
+    return any(
+        p.name == "model" or p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 def _make(slot: str, spec: str, **kwargs: Any) -> Any:
     """Instantiate ``slot`` from a name that may carry a ``:model`` suffix."""
     base, sep, model = spec.partition(":")
+    cls = _resolve(slot, base)
     if sep and model and "model" not in kwargs:
+        # Only model-bearing slots (llm/embedder/vlm) accept the suffix; stores/writers/
+        # parsers take no ``model`` kwarg, so a suffix on those is a user error. Raise a
+        # typed RegistryError instead of letting a raw TypeError escape the constructor.
+        if not _accepts_model(cls):
+            raise RegistryError(
+                f"{slot} '{base}' does not accept a ':model' suffix (got '{spec}'); "
+                f"the '{slot}' slot takes no model argument"
+            )
         kwargs["model"] = model
-    return _resolve(slot, base)(**kwargs)
+    return cls(**kwargs)
 
 
 def get_parser(name: str = "docling", **kwargs: Any) -> Any:

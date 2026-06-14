@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from indx._version import __version__
 from indx.agent.connector import KnowledgeConnector
 from indx.errors import MissingExtraError
 
@@ -51,7 +52,10 @@ def build_mcp_server(connector: KnowledgeConnector, *, name: str | None = None) 
     handler functions keep their static types — mypy stays strict over this module.
     """
     fast_mcp = _load_fastmcp()
-    server = fast_mcp(name or connector.name)
+    # Pass indx's own version so the MCP initialize handshake advertises serverInfo.version
+    # as indx's own ``__version__``, not FastMCP's package version — both FastMCP variants
+    # accept it.
+    server = fast_mcp(name or connector.name, version=__version__)
 
     def indx_search(query: str, k: int = 5, doc_type: str | None = None) -> dict[str, Any]:
         """Semantic search over the indx knowledge space."""

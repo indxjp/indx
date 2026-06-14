@@ -9,6 +9,42 @@ major/minor/patch mean for the CLI, the SDK, and the `.indx` artifact format.
 
 ## [Unreleased]
 
+## [0.0.5] — 2026-06-14
+
+A bug-fix release resolving 25 bugs surfaced by an end-to-end bug-hunt over the 0.0.4
+feature set (granular load, composite spaces, CRUD, home DB, filtered import). Each fix
+ships with a regression test; validated offline and live against real OpenAI/Anthropic.
+No new features, no schema change.
+
+### Fixed
+
+- **Honest build provenance.** A `build` never runs an LLM/VLM, so the sealed manifest
+  **and** the CLI `--json`/text summary now report `llm`/`vlm = none` instead of the
+  requested slot. `DirectoryPipeline.components` exposes the slot names as actually sealed.
+- **Filtered import correctness.** Path-aware exclude globs (`**/_drafts/**` now excludes
+  top-level dirs, not just leaves — was bare `fnmatch` with no `**` semantics).
+- **CRUD relation integrity.** `update` / re-add no longer destroys cross-document
+  relation edges — relations are recomputed over the full corpus after the change.
+- **Robust ingest.** Binary / non-UTF-8 files are skipped instead of poisoning retrieval;
+  CJK/non-Latin documents now get non-empty topics (Unicode-aware tokenizer).
+- **`compose`** can create a parent federation that does not yet exist.
+- **`[enrich] metadata`** config is now honored.
+- Registry `slot:model` on a non-model slot raises a typed error instead of a raw
+  `TypeError`.
+- App read/browse endpoints get the same path-containment guard as export.
+- `ask` bad-path exit code is now consistent with `query`; `add`/`rm` no-ops warn instead
+  of printing a silent green `✓ 0 docs`.
+- `inspect` renders `embedding = none` (was a malformed `embedding=/None`).
+- MCP `serverInfo.version` reports indx's version, not FastMCP's.
+- `/api/query` no longer inlines the full embedding vector in each hit.
+- The `vectors.f32` sidecar records contributing chunk ids in row order, so a reader can
+  recover the row→chunk-id mapping when some chunks are unembedded.
+
+### Docs
+
+- README and reference docs corrected to the real **value-first** CLI argument order
+  (`indx query "text" [space]`).
+
 ## [0.0.4] — 2026-06-14
 
 Five additive features for working with knowledge spaces beyond the initial all-or-nothing

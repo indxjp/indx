@@ -11,9 +11,12 @@ from pathlib import Path
 
 import pytest
 
+from indx.config import Config
 from indx.core.context import SpaceContext, StageErrorRecord
+from indx.core.parsed import Block
 from indx.errors import StageError
 from indx.pipeline import BuildPlan, DirectoryPipeline
+from indx.pipeline.stages.enrich import EnrichStage
 from indx.utils.cache import CACHE_DIRNAME, StageCache, sha256_text
 
 OFFLINE = {"parser": "plaintext", "llm": "none", "embedder": "hash", "store": "jsonl"}
@@ -230,6 +233,55 @@ def test_resume_reuses_parse_cache(tmp_path: Path) -> None:
     assert counts["n"] == 1
 
 
+def test_resume_invalidates_on_parser_version_change(tmp_path: Path) -> None:
+    # A parser whose registry name is unchanged but whose ``version`` bumps must NOT serve the
+    # stale cached ParsedDoc under --resume: the version is folded into the cache component_id, so
+    # the second pass is a clean cache miss and the changed parser is re-invoked (bug S2).
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "doc.md").write_text("# Doc\n\nOriginal body text.\n")
+    out = tmp_path / "out"
+
+    counts = {"n": 0}
+
+    class VersionedParser:
+        name = "versioned"
+
+        def __init__(self, version: str, marker: str) -> None:
+            from indx.parsers.plaintext import PlainTextParser
+
+            self.version = version
+            self._marker = marker
+            self._inner = PlainTextParser()
+
+        def parse(self, path: Path) -> object:
+            counts["n"] += 1
+            doc = self._inner.parse(path)
+            # Prepend a version-specific marker block so the resumed run's output is visibly v1 vs
+            # v2 (text is a read-only property derived from blocks).
+            for block in doc.blocks:
+                block.order += 1
+            doc.blocks.insert(0, Block(kind="text", text=self._marker, order=0))
+            return doc
+
+    pipe1 = DirectoryPipeline(  # type: ignore[arg-type]
+        **{**OFFLINE, "parser": VersionedParser("1", "v1-marker")}, out=out, resume=True
+    )
+    space1 = pipe1.run(src)
+    assert counts["n"] == 1  # parsed and cached
+    assert any("v1-marker" in c.text for c in space1.chunks)
+
+    pipe2 = DirectoryPipeline(  # type: ignore[arg-type]
+        **{**OFFLINE, "parser": VersionedParser("2", "v2-marker")}, out=out, resume=True
+    )
+    space2 = pipe2.run(src)
+    # The version bump invalidates the parse cache: the parser is re-invoked (cache miss) and the
+    # produced chunks reflect the v2 output, not the stale v1 text.
+    assert counts["n"] == 2
+    assert any("v2-marker" in c.text for c in space2.chunks)
+    assert not any("v1-marker" in c.text for c in space2.chunks)
+
+
 def test_resume_off_writes_no_cache(tmp_path: Path) -> None:
     src = _tree(tmp_path / "src")
     out = tmp_path / "out"
@@ -269,3 +321,89 @@ def test_corrupt_cache_entry_is_a_miss(tmp_path: Path) -> None:
     entry = next((tmp_path / CACHE_DIRNAME / "parse").glob("*.json"))
     entry.write_text("{not json")
     assert cache.get("parse", "h", "plaintext") is None
+
+
+# ── build provenance honesty (Bug #5) ────────────────────────────────────────
+
+
+def _enrich_stage(pipe: DirectoryPipeline) -> EnrichStage:
+    stage = next(s for s in pipe.stages() if s.name == "enrich")
+    assert isinstance(stage, EnrichStage)
+    return stage
+
+
+def test_build_does_not_claim_llm_or_vlm_provenance(tmp_path: Path) -> None:
+    """build --llm/--vlm must not be recorded as build provenance — no LLM runs at build time.
+
+    The deterministic Enrich stage uses no model, so stamping ``llm=openai`` into the
+    manifest/components would be a false claim (Bug #5). Provenance for these two slots is ``none``
+    regardless of what was requested; parser/embedder/store stay truthful.
+    """
+    pipe = DirectoryPipeline(
+        parser="plaintext",
+        store="jsonl",
+        llm="openai",
+        vlm="openai",
+        embedder="hash",
+        embed=False,
+    )
+    assert pipe._names["llm"] == "none"
+    assert pipe._names["vlm"] == "none"
+    # Regression guard: the fix only narrowed llm/vlm; other slots are still recorded truthfully.
+    assert pipe._names["parser"] == "plaintext"
+    assert pipe._names["store"] == "jsonl"
+
+
+def test_manifest_components_report_llm_none_after_run(tmp_path: Path) -> None:
+    src = _tree(tmp_path / "src")
+    pipe = DirectoryPipeline(
+        parser="plaintext", store="jsonl", embedder="hash", llm="openai", vlm="openai"
+    )
+    space = pipe.run(src)
+    assert space.manifest.components["llm"] == "none"
+    assert space.manifest.components["vlm"] == "none"
+    assert space.manifest.components["parser"] == "plaintext"
+
+
+def test_use_does_not_reintroduce_llm_provenance(tmp_path: Path) -> None:
+    """Rebinding llm/vlm via use() must keep build provenance honest (none)."""
+    pipe = _pipeline()
+    pipe.use(llm="openai", vlm="openai")
+    assert pipe._names["llm"] == "none"
+    assert pipe._names["vlm"] == "none"
+
+
+# ── [enrich] metadata config wired to the build stage (Bug #10) ───────────────
+
+
+def test_enrich_metadata_config_selects_stage_fields(tmp_path: Path) -> None:
+    """metadata=['summary'] config builds an EnrichStage wanting only summary (Bug #10)."""
+    cfg = Config.model_validate({"enrich": {"metadata": ["summary"]}})
+    pipe = DirectoryPipeline(config=cfg, parser="plaintext", store="jsonl", embed=False)
+    stage = _enrich_stage(pipe)
+    assert stage._want_summary is True
+    assert stage._want_topics is False
+    assert stage._want_tags is False
+    assert stage._want_type is False
+
+
+def test_enrich_metadata_subset_run_populates_only_summary(tmp_path: Path) -> None:
+    cfg = Config.model_validate({"enrich": {"metadata": ["summary"]}})
+    src = _tree(tmp_path / "src")
+    pipe = DirectoryPipeline(config=cfg, parser="plaintext", store="jsonl", embedder="hash")
+    space = pipe.run(src)
+    doc = space.documents()[0]
+    assert doc.summary is not None
+    assert doc.topics == []
+    assert doc.tags == []
+    assert doc.doc_type is None
+
+
+def test_enrich_metadata_default_populates_all_four(tmp_path: Path) -> None:
+    """No metadata config → the build EnrichStage still populates all four fields (regression)."""
+    pipe = DirectoryPipeline(parser="plaintext", store="jsonl", embed=False)
+    stage = _enrich_stage(pipe)
+    assert stage._want_summary is True
+    assert stage._want_topics is True
+    assert stage._want_tags is True
+    assert stage._want_type is True

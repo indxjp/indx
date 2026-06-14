@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
+from functools import lru_cache
 from pathlib import PurePosixPath
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -27,6 +28,45 @@ _SIZE_UNITS = {
     "g": 1024**3,
     "gb": 1024**3,
 }
+
+
+@lru_cache(maxsize=512)
+def _glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """Compile a path-aware glob to an anchored regex (cached per distinct pattern).
+
+    Unlike :func:`fnmatch.fnmatch`, ``/`` is significant here so ``**`` semantics work:
+    a leading ``**/`` matches zero-or-more leading dirs (so ``**/_drafts/**`` excludes a
+    *top-level* ``_drafts/`` as well as a nested one), bare ``**`` spans separators, while
+    ``*``/``?`` stay within a single path segment. All other characters are matched literally.
+    """
+    out: list[str] = []
+    i, n = 0, len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "*":
+            if i + 1 < n and pattern[i + 1] == "*":
+                # `**` — consume an optional trailing `/` so `**/` collapses to zero dirs.
+                i += 2
+                if i < n and pattern[i] == "/":
+                    out.append("(?:.*/)?")
+                    i += 1
+                else:
+                    out.append(".*")
+            else:
+                out.append("[^/]*")
+                i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return re.compile(rf"(?s:{''.join(out)})\Z")
+
+
+def _path_match(rel_str: str, pattern: str) -> bool:
+    """Path-aware glob match against a root-relative POSIX path (see :func:`_glob_to_regex`)."""
+    return _glob_to_regex(pattern).match(rel_str) is not None
 
 
 def parse_size(value: int | str) -> int:
@@ -58,12 +98,12 @@ class WalkFilter(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    include: list[str] = Field(default_factory=list)  # path globs; keep iff matches ANY
-    exclude: list[str] = Field(default_factory=list)  # path globs; drop iff matches ANY
+    include: list[str] = Field(default_factory=list)  # `**`-aware path globs; keep iff matches ANY
+    exclude: list[str] = Field(default_factory=list)  # `**`-aware path globs; drop iff matches ANY
     ext: list[str] = Field(default_factory=list)  # extensions, normalized to leading-dot lower
     name: list[str] = Field(default_factory=list)  # filename glob OR substring; keep iff ANY
-    min_size: int | None = None  # bytes (post-parse); inclusive lower bound
-    max_size: int | None = None  # bytes (post-parse); inclusive upper bound
+    min_size: int | None = None  # bytes (raw stat size); inclusive lower bound
+    max_size: int | None = None  # bytes (raw stat size); inclusive upper bound
     max_files: int | None = None  # cap; first-N after the walk's stable sort
     max_depth: int | None = None  # lineage depth (len(lineage)); 0 = root only
 
@@ -110,9 +150,10 @@ class WalkFilter(BaseModel):
     def keep(self, rel: PurePosixPath, *, size_bytes: int, depth: int) -> bool:
         """Decide a single candidate (max_files is applied by the caller, post-sort).
 
-        ``rel`` is the root-relative POSIX path; ``depth`` is ``len(lineage)`` (the number of
-        folders between root and the file). All checks are AND-combined; ``max_files`` is
-        NOT checked here — it is a stateful cap the stage applies after the deterministic sort.
+        ``rel`` is the root-relative POSIX path; ``size_bytes`` is the raw on-disk ``stat``
+        size (the walk runs pre-parse); ``depth`` is ``len(lineage)`` (the number of folders
+        between root and the file). All checks are AND-combined; ``max_files`` is NOT checked
+        here — it is a stateful cap the stage applies after the deterministic sort.
         """
         rel_str = rel.as_posix()
         name = rel.name
@@ -124,8 +165,8 @@ class WalkFilter(BaseModel):
             return False
         if self.max_size is not None and size_bytes > self.max_size:
             return False
-        if self.include and not any(fnmatch.fnmatch(rel_str, g) for g in self.include):
+        if self.include and not any(_path_match(rel_str, g) for g in self.include):
             return False
-        if self.exclude and any(fnmatch.fnmatch(rel_str, g) for g in self.exclude):
+        if self.exclude and any(_path_match(rel_str, g) for g in self.exclude):
             return False
         return not (self.name and not any(fnmatch.fnmatch(name, g) or g in name for g in self.name))

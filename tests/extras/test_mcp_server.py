@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from indx import DirectoryPipeline
+from indx import DirectoryPipeline, __version__
 from indx.agent import connect
 
 pytestmark = pytest.mark.extras
@@ -111,7 +111,10 @@ def test_mcp_stdio_roundtrip(requires_lib, tmp_path: Path) -> None:
         with anyio.fail_after(60):
             async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
-                    await session.initialize()
+                    init = await session.initialize()
+                    # serverInfo.version must advertise indx's version, not FastMCP's own
+                    # package version (regression: bug #16).
+                    assert init.serverInfo.version == __version__
 
                     tools = await session.list_tools()
                     names = {t.name for t in tools.tools}

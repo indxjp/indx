@@ -212,6 +212,145 @@ def test_add_path_outside_root_raises(built: tuple[Path, Path]) -> None:
         space.add("/etc/hostname")
 
 
+def _relative_root_space(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Build a space whose ``manifest.source_root`` is RELATIVE, save it, return the archive path.
+
+    Mirrors the CLI: ``indx ./src`` records ``source_root='src'`` (relative). The CWD is moved into
+    ``tmp_path`` so a cwd-relative ``src/...`` add/remove resolves the way the CLI PATH arg does.
+    """
+    src = tmp_path / "src"
+    (src / "zzz").mkdir(parents=True)
+    (src / "zzz" / "d.txt").write_text("# D\n\ndelta body.\n", encoding="utf-8")
+    space = _pipe().run(str(src), str(tmp_path / "o.jsonl"))
+    space.manifest.source_root = "src"  # force the relative form the CLI stores
+    archive = tmp_path / "rel.indx"
+    space.save(str(archive))
+    monkeypatch.chdir(tmp_path)
+    return archive
+
+
+def test_add_cwd_relative_path_with_relative_source_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bug #4: ``add('src/zzz/added.txt')`` (cwd-relative, relative source_root) must add 1 doc."""
+    archive = _relative_root_space(tmp_path, monkeypatch)
+    (tmp_path / "src" / "zzz" / "added.txt").write_text(
+        "# Added\n\nzylophant token.\n", encoding="utf-8"
+    )
+    space = KnowledgeSpace.load(str(archive))
+    changed = space.add("src/zzz/added.txt")  # the SAME string the CLI passes
+    assert len(changed) == 1
+    doc = space.document(changed[0])
+    assert doc is not None
+    assert doc.path == "zzz/added.txt"  # stored root-relative, not double-joined
+
+
+def test_add_source_root_relative_path_still_works(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The SDK source-root-relative convention (``add('zzz/added.txt')``) keeps working too."""
+    archive = _relative_root_space(tmp_path, monkeypatch)
+    (tmp_path / "src" / "zzz" / "added.txt").write_text("# Added\n\nbody.\n", encoding="utf-8")
+    space = KnowledgeSpace.load(str(archive))
+    changed = space.add("zzz/added.txt")
+    assert len(changed) == 1
+    assert space.document(changed[0]).path == "zzz/added.txt"
+
+
+def test_remove_cwd_relative_path_with_source_root_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bug #S5: ``remove('src/zzz/d.txt')`` (cwd-relative) must drop the doc, dir present."""
+    archive = _relative_root_space(tmp_path, monkeypatch)
+    space = KnowledgeSpace.load(str(archive))
+    removed = space.remove("src/zzz/d.txt")
+    assert len(removed) == 1
+    assert space.document(removed[0]) is None
+    assert not any(d.path == "zzz/d.txt" for d in space.documents_)
+
+
+def test_remove_works_when_source_root_dir_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bug #S5: removal must work even when the source_root dir no longer exists on disk."""
+    archive = _relative_root_space(tmp_path, monkeypatch)
+    # Rename the source dir away so ``root.is_dir()`` is False.
+    (tmp_path / "src").rename(tmp_path / "src-moved")
+
+    space = KnowledgeSpace.load(str(archive))
+    removed = space.remove("src/zzz/d.txt")  # cwd-relative add-style path
+    assert len(removed) == 1
+    assert space.document(removed[0]) is None
+
+    # The bare stored path also still resolves with the dir absent.
+    space2 = KnowledgeSpace.load(str(archive))
+    assert len(space2.remove("zzz/d.txt")) == 1
+
+
+def _xref_space(tmp_path: Path) -> tuple[Path, Path, str, str]:
+    """Build a 2-doc space where a.txt references b.txt. Returns (src, archive, a_id, b_id)."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.txt").write_text("# A\n\nSee b.txt for details.\n", encoding="utf-8")
+    (src / "b.txt").write_text("# B\n\nbravo body.\n", encoding="utf-8")
+    space = _pipe().run(str(src), str(tmp_path / "o.jsonl"))
+    archive = tmp_path / "xref.indx"
+    space.save(str(archive))
+    a_id = next(d.id for d in space.documents_ if d.path == "a.txt")
+    b_id = next(d.id for d in space.documents_ if d.path == "b.txt")
+    # The full build produced the references edge.
+    assert any(
+        str(r.type) == "references" and r.src == a_id and r.dst == b_id for r in space.relations
+    )
+    return src, archive, a_id, b_id
+
+
+def test_reference_edge_survives_update_of_target(tmp_path: Path) -> None:
+    """Bug #6: updating the referenced doc (b) must not destroy the a->b references edge."""
+    _, archive, a_id, b_id = _xref_space(tmp_path)
+    space = KnowledgeSpace.load(str(archive))
+    space.update("b.txt")  # b is in new_ids; the a->b edge merely TOUCHES it
+    assert any(
+        str(r.type) == "references" and r.src == a_id and r.dst == b_id for r in space.relations
+    )
+    live = {d.id for d in space.documents_}
+    assert all(r.src in live and r.dst in live for r in space.relations)
+
+
+def test_reference_edge_survives_readd_of_referencer(tmp_path: Path) -> None:
+    """Bug #6: re-adding the referencer (a) recomputes its outgoing edge, not lose it."""
+    src, archive, a_id, b_id = _xref_space(tmp_path)
+    space = KnowledgeSpace.load(str(archive))
+    space.add("a.txt")  # re-add the source of the edge
+    assert any(
+        str(r.type) == "references" and r.src == a_id and r.dst == b_id for r in space.relations
+    )
+    live = {d.id for d in space.documents_}
+    assert all(r.src in live and r.dst in live for r in space.relations)
+
+
+def test_add_embedder_dim_mismatch_raises_and_does_not_corrupt(built: tuple[Path, Path]) -> None:
+    """Bug #S3: adding with a different-width embedder must raise, not silently mix widths."""
+    from indx.errors import ArchiveError
+
+    src, archive = built
+    (src / "extra.txt").write_text("# Extra\n\nnote.\n", encoding="utf-8")
+    space = KnowledgeSpace.load(str(archive))
+    # Force the space to claim a different embedder/width than the offline hash add will produce.
+    space.manifest.embedding_model = "other"
+    space.manifest.embedding_dim = 1536
+    widths_before = {len(c.embedding) for c in space.chunks if c.embedding}
+    docs_before = len(space.documents_)
+
+    with pytest.raises(ArchiveError, match="embedder mismatch"):
+        space.add("extra.txt")
+
+    # No wrong-width chunks were appended and no doc rows leaked.
+    assert len(space.documents_) == docs_before
+    widths_after = {len(c.embedding) for c in space.chunks if c.embedding}
+    assert widths_after == widths_before
+
+
 def test_ingest_path_single_file(tmp_path: Path) -> None:
     from indx.pipeline.pipeline import ingest_path
     from indx.registry import get_store

@@ -94,6 +94,11 @@ def inspect_command(
     # Counts/types/relations/documents federate over the merged view; the header/manifest line
     # reflects the parent's own manifest (schema/version/embedding).
     stats = view.stats
+    # A space built with --through chunk / --no-embed carries no embedding model or dim; render a
+    # clean `embedding=none` rather than the malformed `embedding=/None`.
+    embedding_label = (
+        f"{escape(m.embedding_model)}/{stats.embed_dim}" if m.embedding_model else "none"
+    )
     console.print(
         f"[bold]{escape(_display_path(space_path))}[/bold]  "
         f"schema={escape(m.schema_version)} indx={escape(m.indx_version)}"
@@ -101,7 +106,7 @@ def inspect_command(
     console.print(
         f"  documents={stats.documents} chunks={stats.chunks} "
         f"relations={stats.relations} embeddings={stats.embeddings} "
-        f"embedding={escape(m.embedding_model or '')}/{stats.embed_dim} "
+        f"embedding={embedding_label} "
         f"bytes_source={stats.bytes_source}"
     )
 
