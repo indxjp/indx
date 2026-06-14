@@ -120,10 +120,28 @@ def test_keep_include_glob() -> None:
     assert not _keep(f, "docs/a.md", depth=1)
 
 
+def test_keep_include_leading_doublestar_matches_root() -> None:
+    # a leading `**/` must match zero leading dirs (top-level) too, not only nested paths
+    f = WalkFilter(include=["**/secret.md"])
+    assert _keep(f, "secret.md", depth=0)  # top-level (was the regression case)
+    assert _keep(f, "a/secret.md", depth=1)
+    assert not _keep(f, "a/other.md", depth=1)
+
+
 def test_keep_exclude_glob() -> None:
     f = WalkFilter(exclude=["**/_d/**"])
     assert _keep(f, "x/y.md", depth=1)
     assert not _keep(f, "x/_d/y.md", depth=2)
+    assert not _keep(f, "_d/y.md", depth=1)  # top-level: leading `**/` collapses to zero dirs
+
+
+def test_keep_exclude_leading_doublestar_drops_top_level_dir() -> None:
+    # Regression for bug #1: README's `--exclude '**/_drafts/**'` must drop a TOP-LEVEL
+    # _drafts/ dir, not only a nested one (fnmatch treated `/` as ordinary and silently leaked it).
+    f = WalkFilter(exclude=["**/_drafts/**"])
+    assert not _keep(f, "_drafts/secret.md", depth=1)  # depth=1 regression case
+    assert not _keep(f, "sub/_drafts/secret.md", depth=2)  # nested still excluded
+    assert _keep(f, "notes/a.md", depth=1)  # unrelated file kept
 
 
 def test_keep_size_bounds_inclusive() -> None:
@@ -193,6 +211,22 @@ def test_exclude_subtree_integration(tmp_path: Path) -> None:
     assert space.skipped_files_ == 1
 
 
+def test_exclude_top_level_dir_doublestar_integration(tmp_path: Path) -> None:
+    # Regression for bug #1 over a real tree: the README pattern `**/_drafts/**` must drop a
+    # TOP-LEVEL _drafts/ dir end-to-end (it leaked before the path-aware matcher).
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.md").write_text("alpha\n")
+    drafts = src / "_drafts"
+    drafts.mkdir()
+    (drafts / "secret.md").write_text("ssh\n")
+    space = _pipeline(WalkFilter(exclude=["**/_drafts/**"])).run(src)
+    paths = [d.path for d in space.documents()]
+    assert "_drafts/secret.md" not in paths
+    assert "a.md" in paths
+    assert space.skipped_files_ == 1
+
+
 def test_max_size_drops_large_file(tmp_path: Path) -> None:
     src = tmp_path / "src"
     src.mkdir()
@@ -201,6 +235,19 @@ def test_max_size_drops_large_file(tmp_path: Path) -> None:
     space = _pipeline(WalkFilter(max_size="1kb")).run(src)
     paths = [d.path for d in space.documents()]
     assert paths == ["small.md"]
+    assert space.skipped_files_ == 1
+
+
+def test_max_size_boundary_is_raw_stat_bytes(tmp_path: Path) -> None:
+    # Pins bug #S7 intent: size filtering is on the RAW on-disk stat byte count, inclusive.
+    # A file of exactly 1024 bytes is kept at max_size='1kb'; 1025 bytes is dropped.
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "exact.md").write_text("y" * 1024)  # exactly 1 KB on disk
+    (src / "over.md").write_text("y" * 1025)  # one byte over
+    space = _pipeline(WalkFilter(max_size="1kb")).run(src)
+    paths = [d.path for d in space.documents()]
+    assert paths == ["exact.md"]  # boundary inclusive on raw stat size
     assert space.skipped_files_ == 1
 
 
@@ -216,6 +263,38 @@ def test_max_files_caps_deterministically(tmp_path: Path) -> None:
     # re-run yields an identical selection
     space2 = _pipeline(WalkFilter(max_files=2)).run(src)
     assert [d.path for d in space2.documents()] == paths
+
+
+def test_max_files_uses_global_path_sort_not_dfs(tmp_path: Path) -> None:
+    # DFS-with-per-directory-sort diverges from a global root-relative path sort when a root
+    # file's stem prefixes a sibling directory name: '.' (0x2E) < '/' (0x2F), so ``sub.md``
+    # sorts before ``sub/x.md`` globally, yet DFS descends into ``sub/`` first. The documented
+    # cap is "first N in sorted walk order", so max_files=1 must keep ``sub.md``.
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "sub").mkdir()
+    (src / "sub" / "x.md").write_text("x")
+    (src / "sub.md").write_text("s")
+    space = _pipeline(WalkFilter(max_files=1)).run(src)
+    paths = [d.path for d in space.documents()]
+    assert paths == ["sub.md"]  # global-sort first, NOT the DFS-first 'sub/x.md'
+    assert space.skipped_files_ == 1
+    # selection is stable across re-runs
+    space2 = _pipeline(WalkFilter(max_files=1)).run(src)
+    assert [d.path for d in space2.documents()] == paths
+
+
+def test_max_files_global_sort_with_dir_prefix_sibling(tmp_path: Path) -> None:
+    # Same boundary with extra siblings: 'a.md' < 'a/b.md' globally, so it wins the cap.
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a").mkdir()
+    (src / "a" / "b.md").write_text("b")
+    (src / "a.md").write_text("a")
+    (src / "z.md").write_text("z")
+    space = _pipeline(WalkFilter(max_files=1)).run(src)
+    assert [d.path for d in space.documents()] == ["a.md"]
+    assert space.skipped_files_ == 2
 
 
 def test_max_depth_zero_root_only(tmp_path: Path) -> None:

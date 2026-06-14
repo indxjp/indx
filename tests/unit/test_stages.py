@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import pytest
+
 from indx.core.relation import RelationType
 from indx.embed.hash_embedder import HashEmbedder
+from indx.errors import StageError
 from indx.parsers.plaintext import PlainTextParser
 from indx.pipeline.stages import (
     ChunkStage,
@@ -51,6 +54,26 @@ def test_relate_sibling_and_continues(empty_context, tmp_path) -> None:
     types = {r.type for r in ctx.space.relations}
     assert RelationType.SIBLING in types
     assert RelationType.CONTINUES in types
+
+
+def test_parse_skips_binary_keeps_good_text(empty_context, tmp_path) -> None:
+    # A binary file alongside a good .md must not be force-decoded into garbage blocks: the
+    # plaintext parser raises on it, which ParseStage surfaces as a per-file StageError naming
+    # the offending path (so the parallel worker records it as a kind=="skip").
+    (tmp_path / "good.md").write_text("# Note\n\nReal content.\n")
+    (tmp_path / "blob.bin").write_bytes(b"\x00\x01\x02\xff" * 64)
+    empty_context.root = tmp_path
+
+    with pytest.raises(StageError) as excinfo:
+        ParseStage(PlainTextParser()).run(_walked(empty_context))
+    assert excinfo.value.path == "blob.bin"
+
+    # And the good doc on its own (no binary present) parses into clean, replacement-char-free
+    # blocks — the sniff doesn't break legitimate text/markdown ingestion.
+    (tmp_path / "blob.bin").unlink()
+    good = PlainTextParser().parse(tmp_path / "good.md")
+    assert [b.text for b in good.blocks] == ["# Note", "Real content."]
+    assert all("�" not in b.text for b in good.blocks)
 
 
 def test_pack_hard_splits_oversized_paragraph() -> None:

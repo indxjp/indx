@@ -29,6 +29,11 @@ from indx.core.relation import Relation, RelationType
 # years (``report2024``), versions (``v2``), quarters (``q1``) — are NOT mistaken for parts,
 # preserving the module's high-precision contract.
 _PART = re.compile(r"(.+?)(?:[ _-]*part[ _-]?|[ _-]+p)(\d+)\b", re.IGNORECASE)
+# A stem carrying MORE THAN ONE part marker (``report-p1-p2``) is ambiguous: ``fullmatch``
+# would anchor on the trailing marker and silently fold earlier ones into the base, bucketing
+# it under a different sequence than its single-marker namesakes (``report-p1``/``report-p2``).
+# We detect and skip such stems rather than group them wrongly (precision over recall, R-3).
+_PART_MARKER = re.compile(r"(?:[ _-]*part[ _-]?|[ _-]+p)\d+\b", re.IGNORECASE)
 _INDEX_STEMS = {"index", "readme", "_index", "overview"}
 
 # A markdown inline link target: the URL/path inside ``](...)``. We only keep the path part,
@@ -81,7 +86,11 @@ def _stem(doc: Document) -> str:
 def _continues(group: list[Document]) -> list[Relation]:
     parts: dict[str, list[tuple[int, Document]]] = {}
     for d in group:
-        m = _PART.fullmatch(_stem(d))
+        stem = _stem(d)
+        # Ambiguous multi-marker stems (e.g. ``report-p1-p2``) are excluded — see _PART_MARKER.
+        if len(_PART_MARKER.findall(stem)) > 1:
+            continue
+        m = _PART.fullmatch(stem)
         if m and m.group(1):
             parts.setdefault(m.group(1).rstrip(" _-").lower(), []).append((int(m.group(2)), d))
     out: list[Relation] = []

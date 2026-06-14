@@ -452,12 +452,20 @@ class KnowledgeSpace(BaseModel):
         pin = sha256
         if pin is None and auto_pin:
             ref_path = Path(ref)
-            target = (
-                ref_path
-                if ref_path.is_absolute() or self._source_path is None
-                else self._source_path.parent / ref_path
-            )
-            if target.is_file():
+            target: Path | None
+            if ref_path.is_absolute():
+                target = ref_path
+            elif self._source_path is not None:
+                target = self._source_path.parent / ref_path
+            else:
+                # In-memory space with a RELATIVE ref: it is unresolvable until the space is bound
+                # to an archive, and ``children()`` will later resolve it against the archive dir —
+                # NOT the cwd. Pinning ``cwd/ref`` here would record a digest for a path that
+                # resolve never uses, producing a spurious "child checksum mismatch" after
+                # save+reload. Skip the pin; an absolute ref or a bound space still pins (pin path
+                # == resolve path).
+                target = None
+            if target is not None and target.is_file():
                 pin = fmt.file_sha256(target)
         stored = ChildRef(name=name, ref=ref, sha256=pin)
         kept = [c for c in self.manifest.children if c.name != name]
@@ -498,6 +506,29 @@ class KnowledgeSpace(BaseModel):
         pipe = pipeline if pipeline is not None else self._pipeline_for_manifest()
         store = self._live_store()
         result = ingest_path(pipe, root, rel_paths, store=store)
+
+        # Guard BEFORE mutating any row list: if the space already records an embedder, a CRUD-add
+        # that embeds with a different width (or a different model) would silently append
+        # wrong-width vectors that only blow up far away at search time (``StageError: dimension
+        # mismatch``). Surface it here, leaving the space untouched, with an actionable message.
+        if (
+            self.manifest.embedding_model is not None
+            and self.manifest.embedding_dim is not None
+            and result.embedding_dim is not None
+            and (
+                result.embedding_dim != self.manifest.embedding_dim
+                or result.embedding_model != self.manifest.embedding_model
+            )
+        ):
+            from indx.errors import ArchiveError
+
+            raise ArchiveError(
+                "cannot ingest: embedder mismatch with the space's existing vectors — space "
+                f"was embedded with {self.manifest.embedding_model!r} (dim "
+                f"{self.manifest.embedding_dim}) but this add used "
+                f"{result.embedding_model!r} (dim {result.embedding_dim}); rebuild the space "
+                "with a consistent embedder instead of mixing widths"
+            )
 
         new_ids = [d.id for d in result.documents]
         # Replace any prior doc with the same stable id (idempotent re-add): drop its rows first.
@@ -602,14 +633,27 @@ class KnowledgeSpace(BaseModel):
                 "(CRUD ingests files under the space's original indexed root)"
             )
         target = Path(path)
-        abs_target = target if target.is_absolute() else (root / target)
-        try:
-            rel_root = abs_target.resolve().relative_to(root.resolve())
-        except ValueError as exc:
+        # ``source_root`` may be stored RELATIVE (a build like ``indx ./clean`` records
+        # ``source_root='clean'``), while the CLI PATH arg is validated against (and typed
+        # relative to) the CWD. Resolve the incoming relative target against the CWD first, then
+        # fall back to the source-root-relative convention the SDK tests rely on — never blindly
+        # ``root / target`` (that double-joins ``clean/clean/...`` and silently adds 0 docs).
+        candidates = [target] if target.is_absolute() else [Path.cwd() / target, root / target]
+        root_resolved = root.resolve()
+        abs_target: Path | None = None
+        for cand in candidates:
+            try:
+                cand.resolve().relative_to(root_resolved)
+            except ValueError:
+                continue
+            abs_target = cand
+            break
+        if abs_target is None:
             raise ArchiveError(
                 f"cannot ingest {path!r}: it is not under the space's source root "
                 f"{self.manifest.source_root!r}"
-            ) from exc
+            )
+        rel_root = abs_target.resolve().relative_to(root_resolved)
 
         abs_resolved = abs_target.resolve()
         if abs_resolved.is_dir():
@@ -635,80 +679,78 @@ class KnowledgeSpace(BaseModel):
         for d in self.documents_:
             if d.path == s or d.path == norm:
                 return d.id
+
+        # Build candidate root-relative forms so ``remove`` matches by the SAME path string a
+        # caller would ``add`` (e.g. the cwd-relative ``clean/zzz/d.md`` for source_root='clean').
+        # Doc ids are ``stable_hash(<root-relative path>)``, so we must derive that form whether or
+        # not the source_root dir still exists on disk. Every filesystem call is guarded; an absent
+        # root degrades to a purely-lexical prefix strip instead of hashing the raw string.
         root = Path(self.manifest.source_root)
-        if root.is_dir():
-            abs_target = Path(s) if Path(s).is_absolute() else (root / s)
-            try:
+        candidates: list[str] = [norm]
+        root_posix = root.as_posix().rstrip("/")
+        if root_posix and (norm == root_posix or norm.startswith(root_posix + "/")):
+            # Strip a leading ``source_root/`` prefix lexically: 'clean/zzz/d.md' -> 'zzz/d.md'.
+            stripped = norm[len(root_posix) :].lstrip("/")
+            if stripped:
+                candidates.insert(0, stripped)
+        try:
+            if root.is_dir():
+                abs_target = Path(s) if Path(s).is_absolute() else (Path.cwd() / s)
                 rel = abs_target.resolve().relative_to(root.resolve()).as_posix()
-            except ValueError:
-                rel = norm
+                candidates.insert(0, rel)
+        except (ValueError, OSError):
+            pass
+
+        for cand in candidates:
             for d in self.documents_:
-                if d.path == rel:
+                if d.path == cand:
                     return d.id
-            return stable_hash(rel)
-        return stable_hash(norm)
+        return stable_hash(candidates[0])
 
     def _drop_doc_rows(self, doc_id: str) -> None:
         """Drop a document and its chunks (relations handled separately by the caller)."""
         self.documents_ = [d for d in self.documents_ if d.id != doc_id]
         self.chunks = [c for c in self.chunks if c.doc_id != doc_id]
 
-    def _rederive_relations(self, result: IngestResult) -> None:
-        """Recompute relations after an ``add`` so edges touching the new doc(s) are correct.
+    def _rederive_relations(self, result: IngestResult) -> None:  # noqa: ARG002
+        """Recompute ALL relations over the WHOLE live corpus after an ``add`` (Feature 3).
 
-        Structural edges (``sibling``/``parent``/``continues``) need only ``Document`` metadata, so
-        they are recomputed across the WHOLE merged document set (deterministic, folder-local).
-        Content edges (``references``/``duplicate-of``) need parsed text, which is only available
-        for the freshly-ingested doc(s); those are taken from ``result.relations``. Pre-existing
-        content edges between surviving old docs are preserved from the prior relation list. The
-        union is deduped; dangling edges are pruned by the caller.
+        Structural edges (``sibling``/``parent``/``continues``) need only ``Document`` metadata.
+        Content edges (``references``/``duplicate-of``) need parsed text — which a single-file
+        ingest only has for the re-added doc, so taking content edges from the ingest's own subset
+        loses every cross-doc edge that merely TOUCHES the re-added doc (a survivor ``a`` -> the
+        re-added ``b``), and ``update`` (remove-then-add) drops them entirely. To stay correct AND
+        consistent with a fresh full build, recompute every edge over all live docs using each doc's
+        chunk text as a stand-in for its parsed text (the mention-matching and duplicate-hash logic
+        both read ``ctx.parsed[doc.id].text``). ``result`` is unused now (the recompute covers it).
         """
-        from indx.core.relation import RelationType
+        self.relations = self._relate_full_corpus()
 
-        live_ids = {d.id for d in self.documents_}
-        new_ids = {d.id for d in result.documents}
-        content = {RelationType.REFERENCES, RelationType.DUPLICATE_OF}
+    def _relate_full_corpus(self) -> list[Relation]:
+        """Run :class:`~indx.pipeline.stages.relate.RelateStage` over every live doc + its text.
 
-        # Keep prior CONTENT edges only between surviving docs that are NOT being re-derived now.
-        preserved = [
-            r
-            for r in self.relations
-            if r.type in content
-            and r.src in live_ids
-            and r.dst in live_ids
-            and r.src not in new_ids
-            and r.dst not in new_ids
-        ]
-        # The ingest's own relations carry the new doc's structural + content edges within the
-        # walked subset; recompute structural edges over the full merged document set so the new
-        # doc's siblings/parents to existing docs appear.
-        structural = self._structural_relations()
-        new_content = [r for r in result.relations if r.type in content]
-
-        merged: list[Relation] = []
-        seen: set[tuple[str, str, str]] = set()
-        for r in (*structural, *new_content, *preserved):
-            key = (str(r.type), r.src, r.dst)
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(r)
-        self.relations = merged
-
-    def _structural_relations(self) -> list[Relation]:
-        """Recompute folder-structural edges (sibling/parent/continues) over all live docs.
-
-        Mirrors :class:`~indx.pipeline.stages.relate.RelateStage` for the metadata-only edges; runs
-        it over a context holding every live document with no parsed text, so only structural edges
-        are produced (content edges need ``ctx.parsed``).
+        Synthesizes a :class:`~indx.core.parsed.ParsedDoc` per document from its chunks' text so the
+        content-derived edges (references/duplicate-of) are recomputed too — an archive-loaded space
+        has no live ``ctx.parsed``, but chunk text preserves the in-text filename mentions and is
+        whitespace-normalized identically for the duplicate hash, so the resulting edge SET matches
+        a fresh full build. Docs are path-sorted so folder grouping (and thus emission order) is
+        deterministic and matches a fresh build, which is what keeps "build then add" sealing
+        byte-identically to a single full build.
         """
         from indx.core.context import SpaceContext
+        from indx.core.parsed import Block, ParsedDoc
         from indx.pipeline.stages.relate import RelateStage
 
         ctx = SpaceContext(root=Path("."))
-        # Sort by path so the per-folder grouping (dict insertion order) is deterministic and
-        # matches a fresh full build regardless of the order rows were appended by CRUD.
         ctx.space.documents_ = sorted(self.documents_, key=lambda d: d.path)
+        chunks_by_doc: dict[str, list[Chunk]] = {}
+        for c in sorted(self.chunks, key=lambda c: c.position):
+            chunks_by_doc.setdefault(c.doc_id, []).append(c)
+        for doc in ctx.space.documents_:
+            blocks = [
+                Block(text=c.text, order=i) for i, c in enumerate(chunks_by_doc.get(doc.id, []))
+            ]
+            ctx.parsed[doc.id] = ParsedDoc(source_path=doc.path, blocks=blocks)
         RelateStage().run(ctx)
         return list(ctx.space.relations)
 

@@ -295,10 +295,20 @@ class _Part(StrEnum):
     manifest = "manifest"
 
 
+class _Transport(StrEnum):
+    """Valid `mcp --transport` values — rendered by Typer as a Click Choice (clean exit-2)."""
+
+    stdio = "stdio"
+    sse = "sse"
+    streamable_http = "streamable-http"
+
+
 @app.command(name="compose")
 @_handle_errors
 def compose(
-    parent: Path = typer.Argument(..., exists=True, help="Parent .indx to edit (in place)."),
+    parent: Path = typer.Argument(
+        ..., help="Parent .indx to edit, or a new path to create the federation at."
+    ),
     add: list[Path] = typer.Option(
         [], "--add", help="Child .indx archive to reference (repeatable).", exists=True
     ),
@@ -431,6 +441,7 @@ def ask(
     question: str = typer.Argument(..., help="Question to ask."),
     space: Path | None = typer.Argument(
         None,
+        exists=True,
         help="A .indx archive or output directory (default: the home space $INDX_HOME).",
     ),
     k: int = typer.Option(5, "-k", help="Chunks to retrieve."),
@@ -582,8 +593,8 @@ def mcp_command(
     name: str | None = typer.Option(
         None, "--name", help="Server name advertised to MCP clients (default: archive stem)."
     ),
-    transport: str = typer.Option(
-        "stdio",
+    transport: _Transport = typer.Option(
+        _Transport.stdio,
         "--transport",
         help="MCP transport: 'stdio' (default), 'sse', or 'streamable-http'.",
     ),
@@ -609,10 +620,10 @@ def mcp_command(
     # corrupts the very first protocol exchange. Use stderr unconditionally (harmless for the
     # http transports too) so `indx mcp <archive>` is a drop-in MCP server for any client.
     Console(stderr=True).print(
-        f"[bold]indx mcp[/bold] → serving '[cyan]{escape(connector.name)}[/cyan]' over {transport} "
-        "(Ctrl-C to stop)",
+        f"[bold]indx mcp[/bold] → serving '[cyan]{escape(connector.name)}[/cyan]' over "
+        f"{transport.value} (Ctrl-C to stop)",
     )
-    connector.serve(transport=transport)
+    connector.serve(transport=transport.value)
 
 
 # Register the `indx home` sub-group (Feature 4). `_wire_home` builds the path/stats/reset

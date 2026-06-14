@@ -16,6 +16,8 @@ from rich.markup import escape
 from indx.archive import format as fmt
 from indx.archive import read_archive
 from indx.cli._render import console, resolve_archive
+from indx.core.knowledge_space import KnowledgeSpace, Manifest
+from indx.errors import ArchiveError
 
 
 def compose_command(
@@ -42,9 +44,21 @@ def compose_command(
     if name is not None and len(name) != len(add):
         raise typer.BadParameter(f"--name count ({len(name)}) must equal --add count ({len(add)})")
 
-    parent_archive = resolve_archive(parent)
-    # Load the parent fully so save() re-writes a complete archive (read_archive binds the source).
-    space = read_archive(parent_archive)
+    # `compose` doubles as the federation CREATION step (README: `indx compose ./all.indx --add`):
+    # an ABSENT parent path means "create an empty parent space here", while an existing one is
+    # edited in place. resolve_archive raises ArchiveError when the path holds no .indx; treat that
+    # (and a literally-missing path) as the create case, sealing a fresh empty manifest.
+    try:
+        parent_archive = resolve_archive(parent)
+    except ArchiveError:
+        if Path(parent).exists() and not Path(parent).is_dir():
+            raise
+        parent_archive = Path(parent)
+        space = KnowledgeSpace(manifest=Manifest())
+        space._bind_source(parent_archive)
+    else:
+        # Load the parent fully so save() re-writes a complete archive (read_archive binds source).
+        space = read_archive(parent_archive)
     base = Path(relative_to) if relative_to is not None else parent_archive.parent
 
     names: list[str] = []

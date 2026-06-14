@@ -31,7 +31,13 @@ _META_TAGS = "tags"
 _META_SUMMARY = "summary"
 _DEFAULT_METADATA: tuple[str, ...] = (_META_TYPE, _META_TOPICS, _META_TAGS, _META_SUMMARY)
 
-_WORD = re.compile(r"[a-z][a-z0-9]{3,}")
+# Tokenizer for term-frequency topics. CJK scripts (Hiragana ぀-ヿ, Katakana, CJK ideographs
+# 㐀-鿿, Hangul 가-힣) are unsegmented and never lowercased by ``str.lower``, so the original
+# ASCII-only ``[a-z][a-z0-9]{3,}`` returned no tokens for Japanese/Chinese/Korean text — leaving
+# ``topics`` empty for any non-Latin document. We additionally emit each CJK character as its own
+# token (the simplest deterministic segmentation for unsegmented scripts) so topics are non-empty,
+# while the Latin branch keeps the exact prior behaviour (so the ASCII corpus golden is unchanged).
+_WORD = re.compile(r"[a-z][a-z0-9]{3,}|[぀-ヿ㐀-鿿가-힣]")
 _STOP = {
     "this",
     "that",

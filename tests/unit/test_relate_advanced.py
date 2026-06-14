@@ -230,3 +230,26 @@ def test_continues_not_emitted_for_version_suffixed_files(tmp_path: Path) -> Non
     (tmp_path / "spec-v1.md").write_text("Version one.\n")
     (tmp_path / "spec-v2.md").write_text("Version two.\n")
     assert _edges(_build(tmp_path), RelationType.CONTINUES) == set()
+
+
+def test_continues_skips_ambiguous_multipart_stems(tmp_path: Path) -> None:
+    # A stem with more than one part marker is ambiguous: ``fullmatch`` anchors on the trailing
+    # marker and folds earlier ones into the base, so ``report-p1-p1`` and ``report-p1-p2`` both
+    # bucket under base ``report-p1`` and would emit a spurious CONTINUES edge between them. Such
+    # stems must be excluded rather than mis-grouped (precision over recall, R-3).
+    (tmp_path / "report-p1-p1.md").write_text("Nested part one.\n")
+    (tmp_path / "report-p1-p2.md").write_text("Nested part two.\n")
+    cont = _edges(_build(tmp_path), RelationType.CONTINUES)
+    assert all("report-p1-p1.md" not in pair for pair in cont)
+    assert all("report-p1-p2.md" not in pair for pair in cont)
+
+
+def test_continues_single_marker_sequence_still_links(tmp_path: Path) -> None:
+    # Guard: excluding multi-marker stems must not regress ordinary single-marker grouping,
+    # even when an ambiguous multi-marker namesake is present in the same folder.
+    (tmp_path / "report-p1.md").write_text("Part one.\n")
+    (tmp_path / "report-p2.md").write_text("Part two.\n")
+    (tmp_path / "report-p1-p2.md").write_text("Ambiguous multi-part.\n")
+    cont = _edges(_build(tmp_path), RelationType.CONTINUES)
+    assert ("report-p1.md", "report-p2.md") in cont
+    assert all("report-p1-p2.md" not in pair for pair in cont)

@@ -192,12 +192,16 @@ def build_command(
         _render_plan(pipeline.plan(directory))
         return
 
+    # Read the resolved slot names from the pipeline (bug #5: honest provenance) so the CLI
+    # summary matches what is sealed into manifest.components — notably llm/vlm read "none" for
+    # a build, since the build-time enricher never invokes a model regardless of the request.
+    resolved = pipeline.components
     components = {
-        "parser": cfg.parser.engine,
-        "llm": cfg.enrich.llm,
-        "vlm": cfg.enrich.vlm,
-        "embedder": cfg.embed.model,
-        "store": cfg.store.backend,
+        "parser": resolved.get("parser", cfg.parser.engine),
+        "llm": resolved.get("llm", cfg.enrich.llm),
+        "vlm": resolved.get("vlm", cfg.enrich.vlm),
+        "embedder": resolved.get("embedder", cfg.embed.model),
+        "store": resolved.get("store", cfg.store.backend),
         "format": cfg.output.format,
     }
 
@@ -221,8 +225,9 @@ def build_command(
         f"([cyan]{elapsed:.2f}s[/cyan])"
     )
     console.print(
-        f"  components: parser={cfg.parser.engine} llm={cfg.enrich.llm} "
-        f"embedder={cfg.embed.model} store={cfg.store.backend} format={cfg.output.format}"
+        f"  components: parser={components['parser']} llm={components['llm']} "
+        f"embedder={components['embedder']} store={components['store']} "
+        f"format={components['format']}"
     )
 
 

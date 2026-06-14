@@ -331,7 +331,12 @@ def test_demo_builds_offline_and_returns_summary(client: TestClient) -> None:
 # --------------------------------------------------------------------------- browse
 
 
-def test_browse_lists_directories_first(client: TestClient, tmp_path: Path) -> None:
+def test_browse_lists_directories_first(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Browse under the server CWD: the containment guard only allows the working-directory tree
+    # (or an app-owned indx-app-* temp dir), so serve from tmp_path before browsing it.
+    monkeypatch.chdir(tmp_path)
     (tmp_path / "z_dir").mkdir()
     (tmp_path / "a_dir").mkdir()
     (tmp_path / "file.txt").write_text("x")

@@ -13,6 +13,7 @@ import json
 import sys
 from pathlib import Path
 
+from indx.archive import format as fmt
 from indx.archive.writer import write_archive
 from indx.core.knowledge_space import KnowledgeSpace
 from indx.errors import IndxError
@@ -50,7 +51,7 @@ def _stats(space: KnowledgeSpace) -> dict[str, object]:
 def _write_index_json(space: KnowledgeSpace, path: Path) -> None:
     # Embeddings are never inlined into index.json — they live under embeddings/ (§6).
     index = {
-        "version": space.manifest.schema_version,
+        "version": fmt.SCHEMA_VERSION,
         "root": space.manifest.source_root,
         "metadata": space.manifest.model_dump(),
         "stats": _stats(space),
@@ -74,7 +75,16 @@ def _write_chunks(space: KnowledgeSpace, dest: Path) -> None:
 
 def _write_embeddings(space: KnowledgeSpace, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
-    vectors = [c.embedding for c in space.chunks if c.embedding is not None]
+    # vectors.f32 packs only embedded chunks (unembedded ones contribute no row), so the row
+    # index is NOT the chunk index. Record the contributing chunk ids in row order alongside the
+    # matrix so a reader can recover the row→chunk-id mapping (the bare matrix cannot, once any
+    # chunk is unembedded). `ids` is row-aligned: len(ids) == count == number of rows.
+    vectors: list[list[float]] = []
+    ids: list[str] = []
+    for chunk in space.chunks:
+        if chunk.embedding is not None:
+            vectors.append(chunk.embedding)
+            ids.append(chunk.id)
     dim = len(vectors[0]) if vectors else (space.manifest.embedding_dim or 0)
     if vectors and any(len(v) != dim for v in vectors):
         raise IndxError("ragged embedding dimensions: all chunk embeddings must share one width")
@@ -86,6 +96,7 @@ def _write_embeddings(space: KnowledgeSpace, dest: Path) -> None:
         "model": space.manifest.embedding_model,
         "dim": dim,
         "count": len(vectors),
+        "ids": ids,
         "backend": space.manifest.components.get("store"),
     }
     (dest / "manifest.json").write_text(

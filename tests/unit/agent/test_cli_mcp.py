@@ -34,6 +34,16 @@ def test_mcp_missing_extra_exits_1(space: KnowledgeSpace, tmp_path: Path) -> Non
     assert "mcp" in result.output
 
 
+def test_mcp_bad_transport_exits_2(space: KnowledgeSpace, tmp_path: Path) -> None:
+    # Bug #S11: --transport is constrained to a Choice enum, so a typo is a clean Click usage error
+    # (exit 2) at parse time — BEFORE the missing-extra gate (exit 1) ever runs.
+    archive = tmp_path / "kb.indx"
+    space.save(str(archive))
+    result = runner.invoke(app, ["mcp", str(archive), "--transport", "bogus"])
+    assert result.exit_code == 2
+    assert "streamable-http" in result.output
+
+
 def test_mcp_serves_when_extra_present(
     space: KnowledgeSpace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

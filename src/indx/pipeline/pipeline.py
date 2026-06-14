@@ -21,6 +21,8 @@ on their single phase and remain swappable:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -234,13 +236,25 @@ class DirectoryPipeline:
         s_name, s_inst = _slot_name(store, slot="store", config_value=cfg.store.backend)
         o_name, o_inst = _slot_name(output, slot="output", config_value=cfg.output.format)
 
+        # The build-time Enrich stage is the deterministic, LLM-free scaffold (enrich.py docstring):
+        # no llm/vlm is ever resolved or called on the build path. So the recorded build provenance
+        # for these two slots must read ``none`` rather than the resolved selector — stamping
+        # ``llm=openai`` into the manifest/components would falsely claim an LLM ran. (``ask``
+        # resolves its answering llm from its own path and is unaffected.) The names are still
+        # resolved above so a future LLM enricher can consume them, but they are not recorded as
+        # build provenance here.
+        del l_name, v_name  # resolved but unused for build provenance (build enrichment is local)
         self._names = {
             "parser": p_name or _DEFAULTS["parser"],
-            "llm": l_name or _DEFAULTS["llm"],
-            "vlm": v_name or _DEFAULTS["vlm"],
+            "llm": "none",
+            "vlm": "none",
             "embedder": e_name or _DEFAULTS["embedder"],
             "store": s_name or _DEFAULTS["store"],
         }
+        # The configured ``[enrich] metadata`` list selects which fields the scaffold populates
+        # (technical-spec §9); forwarded to the build-time EnrichStage below so a config of e.g.
+        # ``metadata = ["summary"]`` no longer silently populates topics/tags/type as well.
+        self._enrich_metadata = list(cfg.enrich.metadata)
         self.seed = seed
         self.strict = strict
         self.resume = resume
@@ -255,10 +269,11 @@ class DirectoryPipeline:
 
         # Build (or accept) each component. A passed instance is used verbatim; a name is
         # resolved via the registry, forwarding the per-slot config sub-table as kwargs.
+        # Retain the per-slot parser config: it is folded into the resume cache component_id so a
+        # parser config change that alters parse output is a clean cache miss (bug S2).
+        self._parser_opts = dict(slot_opts.get("parser", {}))
         self._parser = (
-            p_inst
-            if p_inst is not None
-            else get_parser(self._names["parser"], **slot_opts.get("parser", {}))
+            p_inst if p_inst is not None else get_parser(self._names["parser"], **self._parser_opts)
         )
         self._embedder: Embedder | None = (
             (
@@ -297,11 +312,13 @@ class DirectoryPipeline:
             WalkStage(self._filter),
             cast(
                 "Stage",
-                ResumableParseStage(self._parser, self._names["parser"], self._cache, self.jobs),
+                ResumableParseStage(
+                    self._parser, self._parser_component_id(), self._cache, self.jobs
+                ),
             ),
             ChunkStage(),
             RelateStage(),
-            *([EnrichStage()] if enrich else []),
+            *([EnrichStage(metadata=self._enrich_metadata)] if enrich else []),
             *(
                 [
                     cast(
@@ -331,6 +348,16 @@ class DirectoryPipeline:
             stage = factory() if callable(factory) else factory
             self._stages.append(cast("Stage", stage))
             existing.add(name)
+
+    @property
+    def components(self) -> dict[str, str]:
+        """Resolved slot names as sealed into the manifest (bug #5: honest build provenance).
+
+        The CLI build summary reads this rather than the requested config so it can never
+        disagree with ``manifest.components`` — e.g. ``llm``/``vlm`` read ``none`` for a build,
+        since the build-time enricher is LLM-free regardless of the requested slot.
+        """
+        return dict(self._names)
 
     @property
     def store(self) -> VectorStore:  # exposed so the CLI/SDK can query right after a build
@@ -442,7 +469,10 @@ class DirectoryPipeline:
         for slot, value in components.items():
             name, inst = _slot_name(value, slot=slot, config_value=None)
             resolved = name or _DEFAULTS[slot]
-            if slot in self._names:
+            # llm/vlm provenance stays ``none`` on the build path — rebinding them must not
+            # re-introduce the false claim that an LLM ran at build time (the deterministic
+            # Enrich stage uses no model). The resolved name is otherwise unused here.
+            if slot in self._names and slot not in ("llm", "vlm"):
                 self._names[slot] = resolved
             if slot == "parser":
                 self._parser = inst if inst is not None else get_parser(resolved)
@@ -460,7 +490,6 @@ class DirectoryPipeline:
             elif slot == "output":
                 self._output_name = resolved
                 self._output = inst
-            # llm / vlm are recorded for provenance; the deterministic Enrich stage uses no model.
 
         if store_pending is not None:
             resolved, inst = store_pending
@@ -486,6 +515,26 @@ class DirectoryPipeline:
         self._rebind_stages()
         return self
 
+    def _parser_component_id(self) -> str:
+        """Resume cache ``component_id`` for the parse stage: name **plus** parser version.
+
+        The cache addresses a parsed doc by ``(stage="parse", sha256(file), component_id)``. Using
+        the registry name alone meant a parser whose behavior changed but whose name stayed the
+        same would silently serve a stale ParsedDoc under ``--resume`` (bug S2). Folding the
+        parser ``version`` (and a stable hash of any per-slot parser config that can alter parse
+        output) into the id isolates those caches so a version/config bump is a clean cache miss.
+
+        The Parser Protocol declares only ``name``; concrete adapters add ``version``, so we read
+        it defensively (default ``"0"``).
+        """
+        component_id = f"{self._names['parser']}@{getattr(self._parser, 'version', '0')}"
+        if self._parser_opts:
+            opts_hash = hashlib.sha256(
+                json.dumps(self._parser_opts, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()[:16]
+            component_id = f"{component_id}+{opts_hash}"
+        return component_id
+
     def _rebind_stages(self) -> None:
         """Re-point the built-in parse/embed-pack stages at freshly bound components.
 
@@ -496,7 +545,9 @@ class DirectoryPipeline:
         for stage in self._stages:
             if stage.name == "parse" and isinstance(stage, ResumableParseStage):
                 new.append(
-                    ResumableParseStage(self._parser, self._names["parser"], self._cache, self.jobs)
+                    ResumableParseStage(
+                        self._parser, self._parser_component_id(), self._cache, self.jobs
+                    )
                 )
             elif stage.name == "embed-pack" and isinstance(stage, ResumablePackStage):
                 if self._embed and self._embedder is not None:

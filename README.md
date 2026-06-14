@@ -59,7 +59,7 @@ stage: embed-pack
 ✓ 7 docs · 7 chunks · 19 relations → /tmp/indx-demo-XXXX/demo (0.01s)
   components: parser=plaintext llm=none embedder=hash store=jsonl format=.indx
 
-/tmp/indx-demo-XXXX/demo  schema=1 indx=0.0.1
+/tmp/indx-demo-XXXX/demo  schema=2 indx=0.0.4
   documents=7 chunks=7 relations=19 embeddings=7 embedding=hash/256
        Types                    Relations
   type       count        type         count
@@ -83,8 +83,8 @@ Now point it at your own folder:
 ```bash
 indx ./docs --out ./ai-ready.indx --offline   # index a folder, fully offline, zero extra deps
 indx inspect ./ai-ready.indx                   # structure, type histogram, relation sample
-indx query   ./ai-ready.indx "how do I onboard?"
-indx ask     ./ai-ready.indx "what is the leave policy?"   # answer with cited sources
+indx query   "how do I onboard?" ./ai-ready.indx
+indx ask     "what is the leave policy?" ./ai-ready.indx   # answer with cited sources
 indx app                                       # visual configure → build → inspect → query in the browser
 ```
 
@@ -103,8 +103,8 @@ indx home stats                         # counts for the home space
 indx home path                          # print the home dir
 ```
 
-Incremental CRUD works on any `.indx` too — `indx add <space> <path>`, `indx rm <space> <doc|path>`,
-`indx update <space> <path>` mutate a sealed archive in place without a full rebuild.
+Incremental CRUD works on any `.indx` too — `indx add <path> <space>`, `indx rm <doc|path> <space>`,
+`indx update <path> <space>` mutate a sealed archive in place without a full rebuild.
 
 ### Filter what gets indexed, run only the stages you need, compose spaces
 
@@ -117,9 +117,10 @@ indx ./repo --out ./code.indx --offline --ext md --ext py \
 indx ./docs --out ./docs.indx --offline --through chunk
 indx inspect ./docs.indx --part documents --json
 
-# indx of indx: one parent space that federates query/inspect across child archives
+# indx of indx: build an empty parent first, then federate query/inspect across child archives
+indx ./empty --out ./all.indx --offline             # create the (empty) parent space
 indx compose ./all.indx --add ./eng.indx --add ./design.indx
-indx query   ./all.indx "onboarding checklist"      # hits drawn from every child, globally ranked
+indx query   "onboarding checklist" ./all.indx      # value-first; hits drawn from every child, globally ranked
 ```
 
 ## Why it matters: a chunk that remembers everything
@@ -223,7 +224,8 @@ pip install "indx[gcp]"   && indx ./docs --out ./out --gcp     # Document AI →
 > offline `query` is **keyword/lexical** retrieval, *not* semantic vector search — true
 > semantic search needs a real embedder extra (e.g. `bge` or `openai`). Likewise the
 > offline `enrich` step derives metadata (type, topics, tags, summary) **locally, with no
-> LLM call**; LLM/VLM enrichment is opt-in via the cloud/local extras. The default
+> LLM call**; build-time `enrich` is local-only — LLM/VLM synthesis is applied at query time
+> via `ask` (`indx ask` / set a real `--llm`), not during the build. The default
 > (non-`--offline`) stack is cloud-backed — install it with `pip install "indx[cloud]"` and
 > set `OPENAI_API_KEY`.
 
@@ -268,7 +270,7 @@ Every connector exposes the same three read-only tools — **search**, **overvie
 
 ## Status
 
-Alpha (`0.0.1`). The zero-dependency core path (`plaintext` → `hash` → `jsonl` → `.indx`)
+Alpha (`0.0.5`). The zero-dependency core path (`plaintext` → `hash` → `jsonl` → `.indx`)
 runs end to end and is fully air-gapped — reach it with `indx demo` or `--offline`. The
 optional cloud/local backends (docling, openai, ollama, bge-m3, qdrant, plus the managed
 AWS/Azure/GCP profiles, …) are implemented and selected through the registry: install the

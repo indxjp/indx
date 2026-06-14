@@ -90,12 +90,42 @@ def test_cli_space_missing_archive_exit_4(tmp_path: Path) -> None:
     assert res.exit_code == 4
 
 
-def test_cli_rm_unknown_target_exit_0(tmp_path: Path) -> None:
+def test_cli_rm_unknown_target_warns_and_exits_1(tmp_path: Path) -> None:
+    # Bug #14: a 0-match rm is almost always a typo'd id/path, never a legitimate no-op the way
+    # re-adding an unchanged file is — so it warns (not a green ✓) and exits non-zero.
     _, out = _build(tmp_path)
     archive = out / "handbook.indx"
     res = runner.invoke(app, ["rm", "nope.txt", str(archive)])
+    assert res.exit_code == 1
+    assert "no documents matched" in res.stdout
+    assert "removed 0 doc" not in res.stdout
+
+
+def test_cli_rm_no_match_json_stays_exit_0(tmp_path: Path) -> None:
+    # The --json branch is for scripted consumers: it keeps a stable schema and exit 0 even on a
+    # 0-match, so the warning/non-zero signal is the human-output path only.
+    import json
+
+    _, out = _build(tmp_path)
+    archive = out / "handbook.indx"
+    res = runner.invoke(app, ["rm", "nope.txt", str(archive), "--json"])
     assert res.exit_code == 0
-    assert "removed 0 doc" in res.stdout
+    payload = json.loads(res.stdout)
+    assert payload["removed"]["ids"] == []
+    assert payload["removed"]["docs"] == 0
+
+
+def test_cli_add_noop_warns_exit_0(tmp_path: Path) -> None:
+    # Bug #14: an add that ingests nothing (e.g. a path with no ingestable files) used to print a
+    # green ✓ 0-doc line that masked typos — emit a distinct warning while keeping exit 0.
+    src, out = _build(tmp_path)
+    archive = out / "handbook.indx"
+    empty_dir = src / "emptydir"
+    empty_dir.mkdir()
+    res = runner.invoke(app, ["add", str(empty_dir), str(archive)])
+    assert res.exit_code == 0
+    assert "no documents added" in res.stdout
+    assert "✓" not in res.stdout
 
 
 def test_cli_add_json_summary(tmp_path: Path) -> None:

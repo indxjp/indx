@@ -191,6 +191,36 @@ def test_unknown_metadata_key_is_ignored() -> None:
     assert out.doc_type is None  # type not selected
 
 
+# --- non-Latin / CJK topics -------------------------------------------------------------
+
+
+def test_topics_nonempty_for_cjk() -> None:
+    """A Japanese document yields non-empty, deterministic topics (Bug #9).
+
+    The old ASCII-only tokenizer never lowercased or matched CJK, so ``topics`` was empty for
+    any Japanese/Chinese/Korean document. The Unicode-aware tokenizer must produce tokens.
+    """
+    doc = Document(id="d1", path="notes.txt")
+    parsed = _parsed(
+        Block(text="これはテスト文書です。プロジェクトの計画について説明します。", order=0)
+    )
+    first = _enrich(doc.model_copy(deep=True), parsed, metadata=["topics"]).topics
+    second = _enrich(doc.model_copy(deep=True), parsed, metadata=["topics"]).topics
+    assert first  # non-empty for CJK text
+    assert first == second  # deterministic across runs
+
+
+def test_topics_ascii_tokenization_unchanged() -> None:
+    """English tokenization is byte-for-byte unchanged by the Unicode tokenizer (Bug #9 guard)."""
+    doc = Document(id="d1", path="notes.txt")
+    # "epsilon" repeated outranks the singletons; short words (<4 chars) and stopwords drop out.
+    parsed = _parsed(Block(text="Epsilon epsilon epsilon alpha beta gamma the this", order=0))
+    out = _enrich(doc, parsed, metadata=["topics"])
+    assert out.topics[0] == "epsilon"
+    assert "the" not in out.topics  # 3-char word excluded by the {3,} run after the lead char
+    assert "this" not in out.topics  # stopword
+
+
 def test_default_metadata_populates_all_four() -> None:
     doc = Document(id="d1", path="guide.md", lineage=["onboarding"])
     parsed = _parsed(

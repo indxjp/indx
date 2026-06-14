@@ -16,8 +16,9 @@ from indx.errors import MissingExtraError
 class _FastMCP:
     """Stand-in for ``mcp.server.fastmcp.FastMCP``: registers tools and records ``run``."""
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, version: str | None = None) -> None:
         self.name = name
+        self.version = version
         self.tools: dict[str, Any] = {}
         self.ran_transport: str | None = None
 

@@ -128,9 +128,11 @@ def test_cli_query_no_space(tmp_path: Path) -> None:
 # --------------------------------------------------------------------- exit codes
 
 
-def test_ask_explicit_missing_archive_exit4(tmp_path: Path) -> None:
+def test_ask_explicit_missing_archive_exit2(tmp_path: Path) -> None:
+    # Bug #13: `ask` now carries exists=True on its SPACE arg (like `query`), so a missing path is
+    # a Click usage error (exit 2) at parse time — symmetric with `query`, not a deep exit 4.
     res = runner.invoke(app, ["ask", "q", str(tmp_path / "nope.indx")])
-    assert res.exit_code == 4, res.output
+    assert res.exit_code == 2, res.output
 
 
 def test_ask_unknown_llm_exit3(tmp_path: Path) -> None:

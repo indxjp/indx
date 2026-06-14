@@ -71,3 +71,13 @@ def test_credentials_error_maps_to_config_exit_code(
 
 def test_credentials_error_is_a_config_error() -> None:
     assert issubclass(CredentialsError, ConfigError)
+
+
+def test_ask_and_query_bad_space_both_exit_2() -> None:
+    # Bug #13: a missing SPACE path must be a usage error (exit 2) for BOTH `ask` and `query`.
+    # Previously `ask` lacked exists=True, so a bad path slipped past Click and surfaced as an
+    # ArchiveError (exit 4), asymmetric with `query`'s exit 2.
+    ask_res = runner.invoke(app, ["ask", "q", "/no/such.indx"])
+    assert ask_res.exit_code == 2
+    query_res = runner.invoke(app, ["query", "q", "/no/such.indx"])
+    assert query_res.exit_code == 2
