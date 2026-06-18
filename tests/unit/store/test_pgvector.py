@@ -29,6 +29,21 @@ class _Jsonb:
         self.obj = obj
 
 
+class _FakeVector:
+    """Stand-in for ``pgvector.Vector``: wraps a float sequence, iterable like the real class.
+
+    The real ``pgvector`` registers a psycopg dumper only for ``Vector`` (and numpy arrays),
+    never plain ``list`` — so the adapter MUST wrap query/upsert vectors in this type or
+    Postgres rejects them. This fake lets the offline suite assert that wrapping happens.
+    """
+
+    def __init__(self, values: Sequence[float]) -> None:
+        self._values = list(values)
+
+    def __iter__(self) -> Any:
+        return iter(self._values)
+
+
 def _cosine_distance(a: Sequence[float], b: Sequence[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b, strict=False))
     na = math.sqrt(sum(x * x for x in a)) or 1.0
@@ -58,6 +73,10 @@ class _FakeConnection:
         # that lacks the privilege — the failure path that used to orphan the socket.
         self.fail_create_extension = False
         self.closed = False
+        # Record the Python type of every vector param the adapter sends, so a test can prove
+        # they are wrapped in ``pgvector.Vector`` (plain lists would be rejected by Postgres).
+        self.upsert_param_types: list[type] = []
+        self.search_query_type: type | None = None
 
     def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> _FakeCursor:
         params = params or ()
@@ -69,6 +88,7 @@ class _FakeConnection:
             return _FakeCursor([])
         if sql.startswith("SELECT"):
             query, _, k = params
+            self.search_query_type = type(query)
             scored = sorted(
                 (
                     (cid, payload, 1.0 - _cosine_distance(query, emb))
@@ -89,6 +109,7 @@ class _FakeConnection:
         if self.fail_executemany:
             raise RuntimeError("transient write failure")
         for cid, embedding, jsonb in rows:
+            self.upsert_param_types.append(type(embedding))
             # ON CONFLICT DO UPDATE: last write wins, mirroring upsert semantics.
             self.rows[cid] = (list(embedding), dict(jsonb.obj))
 
@@ -132,6 +153,7 @@ def fake_pgvector(monkeypatch: pytest.MonkeyPatch) -> _FakePsycopg:
         conn.registered = True
 
     pgvector_pkg = types.ModuleType("pgvector")
+    pgvector_pkg.Vector = _FakeVector  # type: ignore[attr-defined]
     pgvector_psycopg = types.ModuleType("pgvector.psycopg")
     pgvector_psycopg.register_vector = _register_vector  # type: ignore[attr-defined]
 
@@ -174,6 +196,24 @@ def test_upsert_then_search_descending_order(fake_pgvector: _FakePsycopg) -> Non
     # Round-trip: core types out, provenance preserved.
     assert hits[0].chunk.text == "a"
     assert hits[0].chunk.doc_id == "d"
+
+
+def test_vectors_wrapped_in_pgvector_vector(fake_pgvector: _FakePsycopg) -> None:
+    # pgvector registers a psycopg dumper only for ``pgvector.Vector`` (and numpy arrays) — a
+    # plain ``list[float]`` is adapted as a Postgres ``double precision[]`` and rejected by the
+    # ``vector`` column and the ``<=>`` operator. The adapter must wrap every vector param.
+    import pgvector  # the fake injected by the fixture
+
+    from indx.store.pgvector import PgVectorStore
+
+    store = PgVectorStore("postgresql://x", dim=2)
+    store.upsert([_chunk("a", [1.0, 0.0])])
+    store.search([1.0, 0.0], k=1)
+
+    conn = fake_pgvector.last_conn
+    assert conn is not None
+    assert conn.upsert_param_types == [pgvector.Vector]
+    assert conn.search_query_type is pgvector.Vector
 
 
 def test_upsert_replaces_on_conflict(fake_pgvector: _FakePsycopg) -> None:

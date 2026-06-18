@@ -84,6 +84,66 @@ def test_parse_round_trips_into_parsed_doc(fake_markitdown: None, tmp_path: Path
     assert orders == [0, 1, 2]
 
 
+def test_parse_skips_nul_byte_binary_no_none_chunk(fake_markitdown: None, tmp_path: Path) -> None:
+    # #14 N1: MarkItDown returns the literal string "None" for a NUL-byte file masquerading as
+    # text; the adapter must reject it BEFORE convert() (binary sniff), so no "None" chunk is ever
+    # produced — matching the plaintext parser's rejection of the same file.
+    from indx.errors import StageError
+
+    src = tmp_path / "fake-binary.md"
+    src.write_bytes(b"PK\x03\x04\x00\x00fake binary content\x00\x00\xff\xfe")
+    with pytest.raises(StageError) as excinfo:
+        MarkItDownParser().parse(src)
+    assert excinfo.value.stage == "parse"
+    assert excinfo.value.path == str(src)
+
+
+@pytest.mark.parametrize("ext", [".docx", ".pdf", ".pptx", ".xlsx"])
+def test_parse_does_not_pre_reject_binary_extension(
+    fake_markitdown: None, tmp_path: Path, ext: str
+) -> None:
+    # #20 Bug 1: binary office containers legitimately contain NUL bytes and are exactly what
+    # MarkItDown converts. The pre-gate must NOT reject them on the NUL sniff — they must reach
+    # convert() (here the fake) and round-trip into a ParsedDoc. This locks the over-broad gate
+    # (which dropped every real office doc to 0 chunks) from being reintroduced.
+    src = tmp_path / f"office{ext}"
+    src.write_bytes(b"PK\x03\x04\x00\x00real office container\x00\x00\xff\xfe")
+
+    parsed = MarkItDownParser().parse(src)
+
+    assert parsed.parser == "markitdown"
+    assert [b.text for b in parsed.blocks] == [
+        "# Title",
+        "Alpha beta gamma.",
+        "Delta epsilon zeta.",
+    ]
+
+
+def test_parse_skips_empty_conversion(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # #14 N1: when MarkItDown yields None / whitespace-only text_content, the adapter must treat it
+    # as a parse-skip rather than stringifying it into a chunk.
+    from indx.errors import StageError
+
+    monkeypatch.setattr("indx.parsers.markitdown.require_extra", lambda *a, **k: None)
+
+    class _EmptyMarkItDown:
+        def __init__(self, *, enable_plugins: bool = False) -> None:
+            pass
+
+        def convert(self, source: str) -> _FakeResult:
+            return _FakeResult(None)  # type: ignore[arg-type]  # vendor can return None text
+
+    fake_module = types.ModuleType("markitdown")
+    fake_module.MarkItDown = _EmptyMarkItDown  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "markitdown", fake_module)
+
+    src = tmp_path / "doc.md"
+    src.write_text("text without a NUL byte, but the converter yields no usable text")
+    with pytest.raises(StageError) as excinfo:
+        MarkItDownParser().parse(src)
+    assert excinfo.value.stage == "parse"
+
+
 def test_parse_translates_vendor_failure_to_stage_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -108,6 +168,40 @@ def test_parse_translates_vendor_failure_to_stage_error(
         MarkItDownParser().parse(src)
     assert excinfo.value.stage == "parse"
     assert excinfo.value.path == str(src)
+
+
+def test_parse_hint_fires_for_wrapped_missing_dependency(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # #20 Bug 3: markitdown wraps a docx/pptx missing-extra failure as FileConversionException
+    # whose *message* references the MissingDependencyException cause; the top-level class name is
+    # NOT "MissingDependencyException". The adapter must still emit the install-the-extra hint,
+    # so it matches on the message text, not just the exception class name.
+    from indx.errors import StageError
+
+    monkeypatch.setattr("indx.parsers.markitdown.require_extra", lambda *a, **k: None)
+
+    class _WrappedMarkItDown:
+        def __init__(self, *, enable_plugins: bool = False) -> None:
+            pass
+
+        def convert(self, source: str) -> _FakeResult:
+            raise RuntimeError(  # stands in for FileConversionException
+                "File conversion failed after 1 attempt: MissingDependencyException - "
+                "DocxConverter recognized the input as .docx but needs markitdown[docx]"
+            )
+
+    fake_module = types.ModuleType("markitdown")
+    fake_module.MarkItDown = _WrappedMarkItDown  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "markitdown", fake_module)
+
+    src = tmp_path / "report.docx"
+    src.write_bytes(b"PK\x03\x04\x00\x00")
+    with pytest.raises(StageError) as excinfo:
+        MarkItDownParser().parse(src)
+    assert excinfo.value.stage == "parse"
+    assert "missing an optional dependency" in str(excinfo.value)
+    assert "markitdown[docx]" in str(excinfo.value)
 
 
 def test_construction_without_extra_raises_missing_extra() -> None:

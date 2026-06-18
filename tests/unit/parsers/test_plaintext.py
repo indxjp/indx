@@ -23,11 +23,39 @@ def test_nul_byte_file_raises(tmp_path: Path) -> None:
         PlainTextParser().parse(src)
 
 
-def test_invalid_utf8_file_raises(tmp_path: Path) -> None:
+def test_invalid_utf8_binary_raises(tmp_path: Path) -> None:
+    # True binary (no UTF-16 BOM, contains NUL + invalid-UTF-8 high bytes): must be rejected so
+    # the parse stage records a skip rather than indexing \x00 mojibake.
     src = tmp_path / "random.bin"
-    src.write_bytes(b"\xff\xfe\x00\x01" * 100)
+    src.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00\x01\x02\xff\xfe" * 50)
     with pytest.raises(Exception):  # noqa: B017
         PlainTextParser().parse(src)
+
+
+def test_cp1252_latin1_text_decodes(tmp_path: Path) -> None:
+    # #14 N2: a legacy CP1252/Latin-1 file (not valid UTF-8, no NUL) must decode to correct text
+    # and yield chunks — not be dropped as "binary".
+    src = tmp_path / "menu.md"
+    src.write_bytes(b"# Caf\xe9 Menu\n\nEspresso, Cr\xe8me br\xfbl\xe9e.\n")
+
+    parsed = PlainTextParser().parse(src)
+
+    texts = [b.text for b in parsed.blocks]
+    assert texts == ["# Café Menu", "Espresso, Crème brûlée."]
+    assert all("\x00" not in b.text for b in parsed.blocks)
+
+
+def test_bom_utf16_text_decodes(tmp_path: Path) -> None:
+    # #14 N2: a BOM'd UTF-16 text file (whose ASCII chars contain \x00 bytes) must decode to clean
+    # text, NOT be misclassified as binary by the NUL sniff.
+    src = tmp_path / "wide.md"
+    src.write_bytes(b"\xff\xfe" + "# Title\n\nBody paragraph.\n".encode("utf-16-le"))
+
+    parsed = PlainTextParser().parse(src)
+
+    texts = [b.text for b in parsed.blocks]
+    assert texts == ["# Title", "Body paragraph."]
+    assert all("�" not in b.text and "\x00" not in b.text for b in parsed.blocks)
 
 
 def test_non_ascii_utf8_round_trips_without_replacement_chars(tmp_path: Path) -> None:

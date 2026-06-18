@@ -49,17 +49,35 @@ class PlainTextParser:
     version = "1"
 
     def parse(self, path: Path) -> ParsedDoc:
-        # Sniff for binary/non-text content before the tolerant read_text: a NUL byte or a
-        # strict-UTF-8 decode failure means force-decoding would produce U+FFFD/\x00 mojibake
-        # that poisons retrieval. Raise so the parse stage records this file as a skip rather
-        # than emitting garbage blocks (read_text stays tolerant for the messy_real corpus).
+        # Decode with a fixed, deterministic, content-keyed ladder so legacy-encoded text (Latin-1
+        # / CP1252) and BOM'd UTF-16 survive instead of being dropped as "binary", while true
+        # binaries are still rejected (so the parse stage records them as a skip). The order is
+        # fixed — never charset-sniffed — so the same bytes decode to the same text on every
+        # machine.
         data = Path(path).read_bytes()
-        if b"\x00" in data:
-            raise ValueError(f"skipped non-text/binary file: {path.name}")
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError(f"skipped non-text/binary file: {path.name}") from exc
+        if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+            # A UTF-16 byte-order mark unambiguously means UTF-16 text. This MUST come before the
+            # NUL-byte binary sniff below: UTF-16 encodes every ASCII/Latin character with a zero
+            # byte (``\n`` -> ``0A 00``), so the sniff would otherwise misclassify all real UTF-16
+            # text as binary. The BOM fixes endianness, so the decode is deterministic; only a
+            # genuinely malformed UTF-16 stream (odd length / lone surrogate) is rejected.
+            try:
+                text = data.decode("utf-16")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"skipped non-text/binary file: {path.name}") from exc
+        else:
+            # No UTF-16 BOM: a NUL byte now reliably marks a true binary (force-decoding would
+            # embed ``\x00`` mojibake that poisons retrieval), so reject it.
+            if b"\x00" in data:
+                raise ValueError(f"skipped non-text/binary file: {path.name}")
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                # CP1252 (a Latin-1 superset) is the catch-all for legacy 8-bit text. Five byte
+                # positions (0x81/0x8D/0x8F/0x90/0x9D) are unmapped, so decode with
+                # ``errors="replace"`` to guarantee legacy text is never dropped — deterministic,
+                # and far better than silently losing the whole file.
+                text = data.decode("cp1252", errors="replace")
         # L4: HTML files would otherwise be indexed as raw tag soup ('<!DOCTYPE html>',
         # 'href', …). Detect HTML by extension or a leading doctype/<html> sniff and strip to
         # readable visible text (stdlib only — stays offline & deterministic) BEFORE the same

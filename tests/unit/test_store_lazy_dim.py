@@ -240,6 +240,9 @@ def fake_pgvector(monkeypatch: pytest.MonkeyPatch) -> _FakePgConnection:
     monkeypatch.setitem(sys.modules, "psycopg.types.json", json_mod)
 
     pgvector_pkg = types.ModuleType("pgvector")
+    # The adapter wraps every vector param in ``pgvector.Vector`` (psycopg registers a dumper
+    # only for that type, never plain ``list``); a minimal iterable stand-in suffices here.
+    pgvector_pkg.Vector = lambda values: list(values)  # type: ignore[attr-defined]
     pgvector_psycopg = types.ModuleType("pgvector.psycopg")
     pgvector_psycopg.register_vector = lambda *a, **k: None  # type: ignore[attr-defined]
     pgvector_pkg.psycopg = pgvector_psycopg  # type: ignore[attr-defined]

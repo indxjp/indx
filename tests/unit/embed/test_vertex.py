@@ -145,11 +145,27 @@ def test_task_type_default_and_override(fake_genai: types.ModuleType) -> None:
     assert query._client.models.calls[0]["task_type"] == "RETRIEVAL_QUERY"  # type: ignore[attr-defined]
 
 
-def test_batching_splits_into_multiple_requests(fake_genai: types.ModuleType) -> None:
-    embedder = VertexEmbedder(batch_size=2)
+def test_gemini_embedding_sends_one_text_per_request(fake_genai: types.ModuleType) -> None:
+    # gemini-embedding-* accepts only ONE input text per request on Vertex (a multi-text
+    # request 400s), so the adapter must clamp to 1 regardless of batch_size — even when a
+    # larger batch_size is configured. Order and one-vector-per-input must still hold.
+    embedder = VertexEmbedder(batch_size=8)
     vectors = embedder.embed(["a", "bb", "ccc", "dddd", "eeeee"])
 
-    # Leading component is strictly increasing in len(text) across batch boundaries.
+    assert len(vectors) == 5
+    leading = [v[0] for v in vectors]
+    assert leading == sorted(leading) and len(set(leading)) == len(leading)
+    calls = embedder._client.models.calls  # type: ignore[attr-defined]
+    assert [len(c["contents"]) for c in calls] == [1, 1, 1, 1, 1]
+
+
+def test_non_gemini_model_respects_batch_size(fake_genai: types.ModuleType) -> None:
+    # The single-text clamp is specific to the gemini-embedding-* family; the older
+    # text-embedding-* models batch up to ~250, so a configured batch_size is honored.
+    embedder = VertexEmbedder(model="text-embedding-005", batch_size=2)
+    vectors = embedder.embed(["a", "bb", "ccc", "dddd", "eeeee"])
+
+    assert len(vectors) == 5
     leading = [v[0] for v in vectors]
     assert leading == sorted(leading) and len(set(leading)) == len(leading)
     calls = embedder._client.models.calls  # type: ignore[attr-defined]

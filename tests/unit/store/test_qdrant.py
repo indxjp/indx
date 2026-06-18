@@ -35,6 +35,15 @@ class _VectorParams:
         self.distance = distance
 
 
+class _CollectionInfo:
+    """Mirror of ``get_collection(...).config.params.vectors`` — just the width."""
+
+    def __init__(self, size: int) -> None:
+        vectors = types.SimpleNamespace(size=size)
+        params = types.SimpleNamespace(vectors=vectors)
+        self.config = types.SimpleNamespace(params=params)
+
+
 class _Distance:
     COSINE = "Cosine"
 
@@ -72,15 +81,26 @@ class _FakeQdrantClient:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.init_kwargs = kwargs
         self._points: dict[str, _PointStruct] = {}
-        self.collections: set[str] = set()
+        # Map collection name -> sized width, so get_collection can report the persisted size.
+        self.collections: dict[str, int] = {}
         self.upsert_calls: list[int] = []
+        self.deleted_collections: list[str] = []
 
     def collection_exists(self, name: str) -> bool:
         return name in self.collections
 
     def create_collection(self, name: str, *, vectors_config: Any) -> None:
-        self.collections.add(name)
+        self.collections[name] = vectors_config.size
         self.vectors_config = vectors_config
+
+    def get_collection(self, name: str) -> _CollectionInfo:
+        return _CollectionInfo(self.collections[name])
+
+    def delete_collection(self, name: str) -> None:
+        self.deleted_collections.append(name)
+        self.collections.pop(name, None)
+        # Dropping a collection drops its points too (Qdrant semantics).
+        self._points.clear()
 
     def upsert(self, collection_name: str, *, points: list[_PointStruct], wait: bool) -> None:
         self.upsert_calls.append(len(points))
@@ -156,6 +176,56 @@ def test_construction_creates_sized_collection(fake_qdrant: types.ModuleType) ->
     assert client.vectors_config.size == 2
     # Embedded (no-server) default: a path is passed, not a url.
     assert "path" in client.init_kwargs
+
+
+def test_collection_name_is_configurable(fake_qdrant: types.ModuleType) -> None:
+    """``collection=`` scopes every operation to a per-space collection, not the global ``indx``."""
+    store = QdrantStore(dim=2, collection="space-abc")
+    client: _FakeQdrantClient = store._client  # type: ignore[assignment]
+    assert "space-abc" in client.collections and "indx" not in client.collections
+    # upsert/search/delete all address the configured name.
+    store.upsert([_chunk("a", [1.0, 0.0])])
+    assert [h.chunk.id for h in store.search([1.0, 0.0], k=1)] == ["a"]
+    store.delete(["a"])
+    assert store.search([1.0, 0.0], k=1) == []
+
+
+def test_existing_collection_recreated_on_dim_mismatch(fake_qdrant: types.ModuleType) -> None:
+    """A pre-existing collection at a different width is dropped and recreated, not left to die.
+
+    Regression for issue #24, 1a: re-building with a different-width embedder used to crash at
+    the store stage with a cryptic vendor 400 because the collection was never re-sized.
+    """
+    # Simulate a prior build that sized "indx" to 1536.
+    first = QdrantStore(dim=1536)
+    client: _FakeQdrantClient = first._client  # type: ignore[assignment]
+    assert client.collections["indx"] == 1536
+
+    # Re-open the SAME on-disk client at a new width (the fake ignores path, so reuse it).
+    def _reuse(*_a: Any, **_k: Any) -> _FakeQdrantClient:
+        return client
+
+    fake_qdrant.QdrantClient = _reuse  # type: ignore[attr-defined]
+    second = QdrantStore(dim=256)
+    assert second._client is client
+    assert client.deleted_collections == ["indx"]
+    assert client.collections["indx"] == 256
+    # And it actually works at the new width — no wrong-width upsert death.
+    second.upsert([_chunk("a", [1.0, 0.0])])
+    assert [h.chunk.id for h in second.search([1.0, 0.0], k=1)] == ["a"]
+
+
+def test_existing_collection_kept_when_width_matches(fake_qdrant: types.ModuleType) -> None:
+    """A same-width collection is reused untouched (no needless drop/recreate)."""
+    first = QdrantStore(dim=2)
+    client: _FakeQdrantClient = first._client  # type: ignore[assignment]
+    first.upsert([_chunk("a", [1.0, 0.0])])
+
+    fake_qdrant.QdrantClient = lambda *a, **k: client  # type: ignore[attr-defined]
+    second = QdrantStore(dim=2)
+    assert client.deleted_collections == []  # same width -> never dropped
+    # The prior point survives the reopen.
+    assert [h.chunk.id for h in second.search([1.0, 0.0], k=1)] == ["a"]
 
 
 def test_url_overrides_to_remote_server(fake_qdrant: types.ModuleType) -> None:

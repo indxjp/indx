@@ -63,6 +63,14 @@ class QdrantStore:
     to a deterministic UUID (:func:`_point_id`) and the original id rides in the payload; the
     remaining chunk fields ride along too.
 
+    The collection name is configurable (``[store.qdrant] collection`` / ``collection=``,
+    defaulting to ``"indx"``) so each space can own an isolated collection rather than every
+    corpus piling into one global name. When the named collection already exists at a
+    *different* width than the embedder produces, it is recreated at the new width instead of
+    leaving a wrong-width collection that every upsert dies on with a cryptic vendor 400 —
+    so swapping the embedder model (or running a local preset on a server that previously ran
+    a cloud build) no longer breaks at the store stage after doing all the upstream work.
+
     Attributes:
         name: The registry key for this store (``"qdrant"``).
     """
@@ -75,6 +83,7 @@ class QdrantStore:
         path: str | None = None,
         url: str | None = None,
         dim: int | None = None,
+        collection: str | None = None,
     ) -> None:
         """Construct the store; create the backing collection now or lazily.
 
@@ -86,6 +95,10 @@ class QdrantStore:
             dim: Vector dimensionality the collection is sized to. When ``None``, the
                 collection is created lazily on the first :meth:`upsert`, sized to the
                 width of the first vector.
+            collection: Name of the backing collection (``[store.qdrant] collection``).
+                Defaults to ``"indx"``. Give each space its own name to keep corpora
+                isolated and let a width change be recreated in place rather than colliding
+                with another corpus' collection.
 
         Raises:
             MissingExtraError: If the ``qdrant`` extra is not installed.
@@ -102,6 +115,7 @@ class QdrantStore:
 
         self._models = models
         self._dim = dim
+        self._collection = collection or _COLLECTION
         try:
             # Local-first default: on-disk, no server. ``url`` overrides to a server.
             self._client: QdrantClient = (
@@ -109,32 +123,54 @@ class QdrantStore:
             )
             # Pre-size the collection only when a dim is known; otherwise defer to the
             # first upsert so it is sized to a real vector's width (T10 lazy sizing).
+            # When the dim is known, ``_ensure_collection`` also recreates a pre-existing
+            # collection whose width differs — so a re-build with a different embedder no
+            # longer dies on a wrong-width upsert (issue #24).
             # On reopen of an already-populated on-disk collection (dim unknown), recover
             # the persisted width so search() before any upsert no longer raises spuriously.
             if dim is not None:
-                if not self._client.collection_exists(_COLLECTION):
-                    self._ensure_collection(dim)
-            elif self._client.collection_exists(_COLLECTION):
-                info = self._client.get_collection(_COLLECTION)
+                self._ensure_collection(dim)
+            elif self._client.collection_exists(self._collection):
+                info = self._client.get_collection(self._collection)
                 self._dim = info.config.params.vectors.size
         except Exception as exc:  # normalize vendor errors to a typed IndxError
             raise StageError("store", f"Qdrant initialization failed: {exc}") from exc
-        logger.debug("initialized Qdrant store dim=%s remote=%s", dim, url is not None)
+        logger.debug(
+            "initialized Qdrant store collection=%s dim=%s remote=%s",
+            self._collection,
+            dim,
+            url is not None,
+        )
 
     def _ensure_collection(self, dim: int) -> None:
-        """Create the collection sized to ``dim`` if it does not already exist.
+        """Create the collection sized to ``dim``, recreating it if its width differs.
 
         Idempotent and records the resolved ``dim`` so later upserts reuse it rather than
         re-checking width. Used both for up-front (``dim`` given) and lazy (first-upsert)
-        sizing so there is a single sizing path.
+        sizing so there is a single sizing path. When the collection already exists at a
+        different width, it is dropped and recreated at ``dim`` — safe now that the name is
+        space-scoped — rather than left wrong-width for an upsert to die on (issue #24).
         """
-        if not self._client.collection_exists(_COLLECTION):
-            self._client.create_collection(
-                _COLLECTION,
-                vectors_config=self._models.VectorParams(
-                    size=dim, distance=self._models.Distance.COSINE
-                ),
+        if self._client.collection_exists(self._collection):
+            info = self._client.get_collection(self._collection)
+            if info.config.params.vectors.size == dim:
+                self._dim = dim
+                return
+            # Width mismatch: the collection was sized to a different embedder. Drop and
+            # recreate at the new width (delete+create is the non-deprecated recreate).
+            logger.info(
+                "recreating Qdrant collection %s: width %s -> %s",
+                self._collection,
+                info.config.params.vectors.size,
+                dim,
             )
+            self._client.delete_collection(self._collection)
+        self._client.create_collection(
+            self._collection,
+            vectors_config=self._models.VectorParams(
+                size=dim, distance=self._models.Distance.COSINE
+            ),
+        )
         self._dim = dim
 
     def upsert(self, chunks: list[Chunk]) -> None:
@@ -172,7 +208,7 @@ class QdrantStore:
             for i in range(0, len(points), _BATCH):  # batch upserts (coding-standards §14)
                 # wait=True makes the write durable before returning, so a query in the
                 # same run sees the data (determinism, coding-standards §1.4).
-                self._client.upsert(_COLLECTION, points=points[i : i + _BATCH], wait=True)
+                self._client.upsert(self._collection, points=points[i : i + _BATCH], wait=True)
         except Exception as exc:
             raise StageError("store", f"Qdrant upsert failed: {exc}") from exc
 
@@ -201,7 +237,7 @@ class QdrantStore:
             )
         try:
             result = self._client.query_points(
-                _COLLECTION, query=vector, limit=k, with_payload=True, with_vectors=True
+                self._collection, query=vector, limit=k, with_payload=True, with_vectors=True
             )
         except Exception as exc:
             raise StageError("store", f"Qdrant query failed: {exc}") from exc
@@ -224,7 +260,7 @@ class QdrantStore:
             return
         try:
             self._client.delete(
-                _COLLECTION,
+                self._collection,
                 points_selector=self._models.PointIdsList(
                     points=[_point_id(cid) for cid in chunk_ids]
                 ),

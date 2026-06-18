@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from indx.errors import MissingExtraError
+from indx.errors import MissingExtraError, StageError
 from indx.parsers.base import Parser
 from indx.parsers.docling import DoclingParser
 
@@ -62,9 +62,32 @@ class _FakeDocument:
             yield item, 0
 
 
+class _FakeStatus:
+    """Mimics Docling's ``ConversionStatus`` enum member exposing a ``.name``."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _FakeError:
+    """Mimics Docling's ``ErrorItem`` exposing an ``error_message``."""
+
+    def __init__(self, error_message: str) -> None:
+        self.error_message = error_message
+
+
 class _FakeResult:
-    def __init__(self, document: _FakeDocument) -> None:
+    def __init__(
+        self,
+        document: _FakeDocument,
+        status: _FakeStatus | None = None,
+        errors: list[_FakeError] | None = None,
+    ) -> None:
         self.document = document
+        # A real ConversionResult always carries a status; default to SUCCESS so the happy-path
+        # fakes (which omit it) read as success via the parser's name-based guard.
+        self.status = status if status is not None else _FakeStatus("SUCCESS")
+        self.errors = errors or []
 
 
 class _FakeConverter:
@@ -151,6 +174,49 @@ def test_parse_translates_vendor_error(monkeypatch: pytest.MonkeyPatch, tmp_path
     # StageError names the stage and the offending path.
     assert "parse" in str(excinfo.value)
     assert "kaboom" in str(excinfo.value)
+
+
+def test_parse_raises_on_skipped_status(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Docling signals an unsupported format (.odt/.rst) by returning a SKIPPED result with an
+    # empty document — it does NOT raise. The parser must surface that as a StageError so the
+    # file becomes a visible parse skip instead of silently flowing through as 0 chunks (#17 b1).
+    _install_fake_docling(monkeypatch)
+
+    class _Skipped(_FakeConverter):
+        def convert(self, source: str) -> _FakeResult:
+            return _FakeResult(
+                _FakeDocument([]),
+                status=_FakeStatus("SKIPPED"),
+                errors=[_FakeError("File format not allowed: x.rst")],
+            )
+
+    monkeypatch.setattr(sys.modules["docling.document_converter"], "DocumentConverter", _Skipped)
+
+    parser = DoclingParser()
+    with pytest.raises(StageError) as excinfo:
+        parser.parse(tmp_path / "onboarding.rst")
+    assert excinfo.value.path == str(tmp_path / "onboarding.rst")
+    assert "SKIPPED" in str(excinfo.value)
+    assert "File format not allowed" in str(excinfo.value)
+
+
+def test_parse_succeeds_when_status_absent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Older Docling shapes / fakes may expose no ``status``; the guard must treat that as success
+    # and never manufacture a failure Docling did not report.
+    _install_fake_docling(monkeypatch)
+
+    class _NoStatusResult:
+        def __init__(self, document: _FakeDocument) -> None:
+            self.document = document
+
+    class _NoStatus(_FakeConverter):
+        def convert(self, source: str) -> _NoStatusResult:
+            return _NoStatusResult(_FakeDocument([_FakeTextItem("hello", "text")]))
+
+    monkeypatch.setattr(sys.modules["docling.document_converter"], "DocumentConverter", _NoStatus)
+
+    parsed = DoclingParser().parse(tmp_path / "doc.pdf")
+    assert [b.text for b in parsed.blocks] == ["hello"]
 
 
 def test_construction_without_extra_raises(monkeypatch: pytest.MonkeyPatch) -> None:

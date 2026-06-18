@@ -9,6 +9,124 @@ major/minor/patch mean for the CLI, the SDK, and the `.indx` artifact format.
 
 ## [Unreleased]
 
+## [0.0.7] — 2026-06-18
+
+A bug-fix release resolving issues surfaced by continued end-to-end and web-UI bug-hunting
+across the default, cloud, and `indx app` stacks. Every fix ships with a regression test;
+builds remain byte-identical (determinism preserved). No schema change.
+
+### Fixed
+
+#### Parsing & ingestion
+
+- **`markitdown` parses binary office documents again (#20).** A NUL-byte pre-gate added in
+  0.0.6 rejected *every* file containing a NUL byte — which is every legitimate binary office
+  container — so `.pdf`/`.docx`/`.pptx`/`.xlsx` all produced 0 chunks and were silently dropped
+  to `unindexed`, defeating the parser's entire purpose. The sniff now fires only for text-like
+  extensions (`.md`, `.txt`, `.csv`, `.html`, …), where a NUL genuinely means "binary
+  masquerading as text"; real binaries flow to markitdown's own converters.
+- **`indx[markitdown]` installs the office sub-extras (#20).** The extra now pulls
+  `markitdown[pdf,docx,pptx,xlsx,outlook]` (was `markitdown[pdf]` only), so docx/pptx/xlsx no
+  longer fail with `MissingDependencyException` once the gate is removed.
+- **`docling` no longer silently drops unsupported formats (#17).** Docling signals an
+  unsupported input (`.odt`/`.rst`) by returning a non-success `ConversionResult` with an empty
+  document rather than raising, so the file flowed through as a 0-chunk doc with
+  `parse_failures=0`. The parser now inspects `result.status` and raises on a non-success
+  conversion, turning the silent drop into a visible per-file parse skip (and `--strict-fatal`).
+- **Legacy text encodings survive (#14).** Latin-1/CP1252 text was dropped by a strict UTF-8
+  decode. Decoding now follows a deterministic content-keyed ladder (BOM'd UTF-16 → NUL-reject →
+  UTF-8 → cp1252 with replacement), so legacy text is indexed instead of discarded.
+- **No garbage chunk from binary/empty input (#14).** A binary sniff runs before `convert()` and
+  empty/whitespace output is treated as a parse-skip, so a literal `"None"` chunk no longer
+  reaches the store for NUL-byte input.
+- **Structured-text formats are flagged (#14).** Pandoc-AST JSON, LaTeX, and notebooks were
+  indexed as raw markup silently; a conservative markup sniff now emits a yellow build/CRUD
+  warning.
+- **Source extension is authoritative for `doc_type` (#22).** `.docx`/`.html` were classified
+  as `doc_type="markdown"` because markitdown renders them to markdown-with-headings and the
+  heading heuristic fired first. A non-text source extension is now authoritative; the
+  heading/content-cue heuristics run only for genuinely text inputs.
+- **Parse-skip hint is correct and no longer eaten by Rich markup (#20).** The bracketed extra
+  names in the "0 chunks" warning (`markitdown[docx]`, `indx[docling]`) are now escaped so they
+  render, and the advice points at installing the matching format extra. The adapter's
+  missing-dependency detection also matches the *message* so the wrapped `FileConversionException`
+  cause (docx/pptx) is recognized.
+
+#### Relations, archives & indexes
+
+- **`references` edges fire under the default `docling` parser (#17).** Docling discards link
+  targets (`[Beta](beta.md)` → bare "Beta") from parsed text, so reference relations never fired.
+  Relate now reads the raw source file for textual extensions to recover link structure, while
+  preserving the "relate-after-walk emits no content edges" contract.
+- **CRUD reseal keeps `references` edges (#19).** The add/update/remove reseal path built its
+  context with `root="."`, so after the #17 change it resolved the raw source against the cwd and
+  lost every `references` edge a fresh build emits — violating the "build then add seals
+  byte-identically to a single full build" contract. The relate context is now pinned to
+  `manifest.source_root`.
+- **`Document.chunk_ids`/`references`/`referenced_by` are populated (#14).** Computed as a derived
+  projection at serialize time; archives stay byte-identical and the fields round-trip back into
+  `Document` on `load()`.
+- **`index.json` adjacency matches the sealed archive (#17).** The expanded `out/index.json`
+  shipped empty `chunk_ids`/`references`/`referenced_by` while the `.indx` archive backfilled
+  them; the writer now reuses the archive's serialize-time projection so both agree
+  document-for-document.
+- **Sibling relations degrade gracefully (#14).** The O(n²) sibling pass hit a hard cliff that
+  emitted *zero* edges above `SIBLING_MAX` and paired 0-chunk shells. 0-chunk docs are excluded
+  and the graph degrades to a bounded k-neighbour graph above the cap.
+- **Ghost-entry archive tamper is detected (#13).** `_verify_checksums` now catches ghost
+  entries; checksums simplified to raw bytes.
+- **Build no longer indexes its own output or config (#20).** When `--out` resolves inside the
+  walk root, the output dir, the active `indx.toml`, and any in-tree `*.indx` are auto-excluded,
+  so a rerun does not sweep the previous build's artifacts back in as documents.
+- **`indx add` accepts files outside `source_root` (#14).** Out-of-root targets are staged
+  (home-staging generalized to explicit archives); in-root files still ingest verbatim.
+
+#### Cloud & local backends
+
+- **pgvector accepts vector params (#19).** `PgVectorStore.upsert`/`.search` passed plain
+  `list[float]`, which psycopg adapts as `double precision[]` and pgvector rejects. Every vector
+  param is now wrapped in `pgvector.Vector` at the adapter edge, so real upserts/searches work.
+- **Vertex embedder no longer 400s on multi-text requests (#19).** `gemini-embedding-001` accepts
+  only one input text per request on Vertex; the per-request size is clamped to 1 for the
+  `gemini-embedding-*` family, while older `text-embedding-*` models keep their configured batch
+  size.
+- **Qdrant collections are isolated and re-sizable (#24).** A single hardcoded global `indx`
+  collection was never re-sized, so rebuilding with a different-width embedder died with a cryptic
+  vendor 400 and every corpus piled into one collection. The collection name is now configurable
+  (`collection=` / `[store.qdrant] collection`), a pre-existing collection of differing width is
+  recreated, and `indx app` injects a per-space collection so two app builds never share one.
+
+#### `indx app` web UI
+
+- **App build writes a single archive (#22).** `_run_build_summary()` let the pipeline seal a
+  default-named `handbook.indx` *and* the explicit writer write `<name>.indx`, breaking the
+  single-archive invariant. The pipeline now stays in-memory (`out=None`) so the explicit writer
+  is the sole serialization.
+- **Advanced stack editor never pre-selects an uninstalled backend (#22).** The editor pre-selected
+  the cloud default `parser=docling` even when the extra was absent, producing a disabled+selected
+  option, an invalid config, and a 400 dry-run. Each slot is now sanitized against the installed
+  components, dropping to the first installed backend (else "(default)").
+- **`POST /api/dry-run` returns 400, not 500, on a bad path (#24).** A missing/non-directory path
+  raised a bare stdlib `NotADirectoryError`/`FileNotFoundError`; the handler now widens to
+  `(IndxError, OSError)` → 400, matching `/build` and `/inspect`.
+- **`PUT /api/config` rejects malformed bodies (#24).** A wrong-shaped body silently overwrote
+  `indx.toml` with a DEFAULT config (top-level `Config` is `extra="allow"`); unknown top-level
+  sections are now rejected with 422 in the app layer without loosening the core schema.
+
+#### CLI & reporting
+
+- **`WalkFilter.keep()` restores AND semantics (#13).** Name and extension filters are both
+  required again; the extensionless bypass is limited to no-suffix files.
+- **Offline parse-skip hint is no longer duplicated (#13).** The pipeline sets a sentinel and the
+  builder checks it before emitting, so the offline hint prints once.
+- **`--json` reports `unindexed_documents` from stats (#13).** Read from the space stats instead of
+  a transient `parse_failures_` counter.
+
+#### Internal
+
+- **CI is green (#16).** Fixed all pre-existing lint, type, and app-suite failures so the
+  release gates pass cleanly.
+
 ## [0.0.6] — 2026-06-15
 
 A bug-fix release resolving 11 bugs surfaced by an end-to-end bug-hunt over a clean

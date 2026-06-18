@@ -25,7 +25,9 @@ _SUPPORTED_DIMS: frozenset[int] = frozenset({768, 1536, 3072})
 _DEFAULT_MODEL = "gemini-embedding-001"
 _DEFAULT_DIM = 768
 _DEFAULT_TASK_TYPE = "RETRIEVAL_DOCUMENT"
-# gemini-embedding-001 has a small per-request batch cap on Vertex; chunk defensively.
+# Per-request size for non-gemini-embedding models (text-embedding-* batch up to ~250).
+# gemini-embedding-* is forced to 1 in ``embed`` regardless — Vertex rejects multi-text
+# requests for that family.
 _DEFAULT_BATCH_SIZE = 32
 
 
@@ -105,9 +107,14 @@ class VertexEmbedder:
         """
         if not texts:
             return []
+        # gemini-embedding-* accepts only ONE input text per request on Vertex (a 400 fires
+        # for any multi-text request), unlike the older text-embedding-* models which batch up
+        # to ~250. Clamp the per-request size to 1 for that family so real (multi-chunk) corpora
+        # don't fail; any other configured model keeps its batch size.
+        per_request = 1 if self.model.startswith("gemini-embedding") else self.batch_size
         vectors: list[list[float]] = []
-        for start in range(0, len(texts), self.batch_size):
-            batch = texts[start : start + self.batch_size]
+        for start in range(0, len(texts), per_request):
+            batch = texts[start : start + per_request]
             try:
                 result = self._client.models.embed_content(
                     model=self.model,

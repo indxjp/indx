@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import zipfile
 from collections.abc import Iterable
@@ -136,15 +137,19 @@ def _verify_checksums(zf: zipfile.ZipFile, names: set[str], src: Path, *, verify
     expected = record.get("members", {})
     if not isinstance(expected, dict):
         raise ArchiveError(f"corrupt {fmt.CHECKSUMS} in {src}: 'members' must be an object")
-    for name, want in expected.items():
-        if name not in verify:
-            continue
+    for name in sorted(verify):
         if name not in names:
-            raise ArchiveError(f"archive missing checksummed member {name!r}: {src}")
-        try:
-            got = fmt.checksum(_read_member(zf, name, src).decode("utf-8"))
-        except UnicodeDecodeError as exc:
-            raise ArchiveError(f"corrupt {name} in {src}: {exc}") from exc
+            if name in expected:
+                raise ArchiveError(
+                    f"archive member {name!r} is listed in {fmt.CHECKSUMS} but absent "
+                    f"from the zip in {src}; the archive may have been tampered with"
+                )
+            # truly absent (not in archive, not checksummed): soft skip for selective load
+            continue
+        if name not in expected:
+            continue
+        want = expected[name]
+        got = hashlib.sha256(_read_member(zf, name, src)).hexdigest()
         if got != want:
             raise ArchiveError(
                 f"checksum mismatch for {name!r} in {src}: expected {want}, got {got}"

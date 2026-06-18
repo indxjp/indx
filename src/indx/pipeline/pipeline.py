@@ -46,7 +46,7 @@ from indx.core.knowledge_space import KnowledgeSpace, Manifest
 from indx.core.parsed import ParsedDoc
 from indx.core.relation import Relation
 from indx.embed.base import Embedder
-from indx.errors import RegistryError, StageError
+from indx.errors import MissingExtraError, RegistryError, StageError
 from indx.pipeline.filters import WalkFilter
 from indx.pipeline.stage import Stage
 from indx.pipeline.stages import (
@@ -277,9 +277,23 @@ class DirectoryPipeline:
         # Retain the per-slot parser config: it is folded into the resume cache component_id so a
         # parser config change that alters parse output is a clean cache miss (bug S2).
         self._parser_opts = dict(slot_opts.get("parser", {}))
-        self._parser = (
-            p_inst if p_inst is not None else get_parser(self._names["parser"], **self._parser_opts)
-        )
+        try:
+            self._parser = (
+                p_inst
+                if p_inst is not None
+                else get_parser(self._names["parser"], **self._parser_opts)
+            )
+        except MissingExtraError as exc:
+            # Only annotate when no slot was explicitly chosen (parser=None means "use the
+            # default stack"). An explicit parser= choice is the user's own selection — they
+            # don't need the offline escape-hatch hint.
+            if parser is None:
+                exc.add_note(
+                    "Tip: run with --offline (or pass parser='plaintext') to use the "
+                    "zero-dependency offline stack that requires no extra packages."
+                )
+                exc._offline_hint_added = True  # sentinel for build.py dedup
+            raise
         self._embedder: Embedder | None = (
             (
                 cast("Embedder", e_inst)
@@ -721,6 +735,9 @@ class DirectoryPipeline:
             # H1: surface parse-stage skips (files indexed with 0 chunks) on the space so the CLI
             # can warn. Mirrors the existing ``skipped_files_`` (walk) provenance field.
             space.parse_failures_ = _parse_failure_count(ctx)
+            # N6: surface docs whose extracted text is structured markup/data (not prose) so the
+            # CLI can warn they were chunked as raw tag soup.
+            space.markup_paths_ = _markup_paths(ctx)
 
             # L1: ``run()``'s own ``out`` wins; when it is omitted (the _UNSET sentinel) fall back
             # to the constructor ``out=`` as the default output destination. ``out=None`` (and an
@@ -743,7 +760,8 @@ class IngestResult:
 
     ``parse_failures`` is the count of files the parse stage skipped (recorded as ``kind="skip"``
     parse errors on the context). A CRUD caller surfaces it as a prominent warning so files that
-    were indexed with zero chunks are not silently lost (H1).
+    were indexed with zero chunks are not silently lost (H1). ``markup_paths`` is the analogous
+    list of files whose text was structured markup/data rather than prose (#14 N6).
     """
 
     def __init__(
@@ -755,6 +773,7 @@ class IngestResult:
         embedding_model: str | None,
         embedding_dim: int | None,
         parse_failures: int = 0,
+        markup_paths: list[str] | None = None,
     ) -> None:
         self.documents = documents
         self.chunks = chunks
@@ -762,6 +781,7 @@ class IngestResult:
         self.embedding_model = embedding_model
         self.embedding_dim = embedding_dim
         self.parse_failures = parse_failures
+        self.markup_paths = markup_paths or []
 
 
 def ingest_path(
@@ -810,6 +830,7 @@ def ingest_path(
             embedding_model=space.manifest.embedding_model,
             embedding_dim=space.manifest.embedding_dim,
             parse_failures=_parse_failure_count(ctx),
+            markup_paths=_markup_paths(ctx),
         )
     finally:
         cleanup_extracted(ctx.tmp_root)
@@ -818,6 +839,23 @@ def ingest_path(
 def _parse_failure_count(ctx: SpaceContext) -> int:
     """Count parse-stage per-item skips on the context (files indexed with 0 chunks — H1)."""
     return len([e for e in ctx.errors if e.kind == "skip" and (e.stage or "") == "parse"])
+
+
+def _markup_paths(ctx: SpaceContext) -> list[str]:
+    """Root-relative paths of parsed docs whose text is structured markup/data, not prose (N6).
+
+    Sorted for deterministic output. Reads the live ``ctx.parsed`` populated by Parse, so it sees
+    exactly the text that was chunked.
+    """
+    from indx.pipeline.markup_sniff import looks_like_markup
+
+    by_id = {d.id: d.path for d in ctx.space.documents_}
+    flagged = [
+        by_id[doc_id]
+        for doc_id, parsed in ctx.parsed.items()
+        if doc_id in by_id and parsed is not None and looks_like_markup(parsed.text)
+    ]
+    return sorted(flagged)
 
 
 def _enforce_strict(stage_name: str, ctx: SpaceContext) -> None:

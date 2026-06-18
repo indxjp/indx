@@ -139,6 +139,12 @@ def build_command(
         max_depth=max_depth,
     )
 
+    # Footgun guard (#20 Bug 4): the walk has no self-awareness, so a build whose ``--out`` lands
+    # inside the indexed tree would sweep the PREVIOUS build's artifacts (out/*.indx, index.json,
+    # chunks/*, embeddings/*) back in on a rerun, and self-index the active ``indx.toml``. Auto-
+    # exclude the output dir (when under the walk root), the config file, and any in-tree archive.
+    _auto_exclude_artifacts(walk_filter, root=directory, out=out, config=config)
+
     # Resolve (and thereby validate) the output writer up front, before any pipeline work.
     # cfg.output.format is a free-form string; a typo would otherwise surface only at the final
     # write step — after walk/parse/enrich/embed have all run (wasted compute and, on the
@@ -163,15 +169,16 @@ def build_command(
             out=out,
             filter=walk_filter,
         )
-    except MissingExtraError:
+    except MissingExtraError as exc:
         # A cloud preset (--aws/--azure/--gcp) was used but its backends aren't installed:
         # point at the one-install story for that cloud, then re-raise unchanged.
         if cloud is not None:
             _emit_cloud_hint(cloud)
         # The default stack targets cloud backends. If the user ran the bare command (no slot
-        # flags) and did not ask for any preset, point them at the one-flag escape hatch before
-        # re-raising the original (contract-locked) error unchanged.
-        elif not any_slot_passed and not offline:
+        # flags), did not ask for any preset, and the hint was not already appended by the
+        # pipeline, point them at the one-flag escape hatch before re-raising the original
+        # (contract-locked) error unchanged.
+        elif not any_slot_passed and not offline and not getattr(exc, "_offline_hint_added", False):
             _emit_offline_hint()
         raise
 
@@ -236,14 +243,35 @@ def build_command(
     # indexed with 0 chunks). Non-fatal in non-strict mode (strict already raises), so warn
     # prominently and keep exit 0 — the build still produced a usable archive.
     _warn_parse_failures(space.parse_failures_)
+    _warn_markup_docs(space.markup_paths_)
 
 
 def _warn_parse_failures(parse_failures: int) -> None:
     """Warn (yellow, exit 0) when ``parse_failures`` files were indexed with 0 chunks (H1)."""
     if parse_failures > 0:
+        # ``escape`` the advice: the literal ``[docx]`` / ``[docling]`` are Rich console markup
+        # and would be eaten (the user would see "indx"/"markitdown" with the name gone) if not
+        # escaped — same fix the sibling _warn_markup_docs already applies. The advice is also
+        # format-aware now: many of these failures are a *missing format extra* (markitdown can
+        # read docx/pptx once markitdown[docx]/[pptx] is installed), not a too-weak parser.
+        hint = escape(
+            "install the matching format extra, e.g. markitdown[docx] / markitdown[pptx], "
+            "or try a richer parser, e.g. indx[docling]"
+        )
         console.print(
             f"[yellow]![/yellow] {parse_failures} file(s) could not be parsed and were "
-            "indexed with 0 chunks (try a richer parser, e.g. indx[docling])"
+            f"indexed with 0 chunks ({hint})"
+        )
+
+
+def _warn_markup_docs(markup_paths: list[str]) -> None:
+    """Warn (yellow, exit 0) when files were indexed as raw structured markup, not prose (N6)."""
+    if markup_paths:
+        shown = ", ".join(markup_paths[:3]) + (" …" if len(markup_paths) > 3 else "")
+        console.print(
+            f"[yellow]![/yellow] {len(markup_paths)} file(s) look like structured markup/data, "
+            f"not prose, and were indexed as raw markup ({escape(shown)}) — retrieval quality "
+            "may suffer; consider a format-aware parser or excluding them"
         )
 
 
@@ -348,7 +376,9 @@ def _run_json(
             "relations": len(space.relations),
             "skipped": space.skipped_files_,
         },
-        "parse_failures": space.parse_failures_,
+        "unindexed_documents": space.stats.unindexed_documents,
+        "unindexed_paths": space.stats.unindexed_paths,
+        "markup_paths": space.markup_paths_,
         "elapsed_s": round(end - start, 6),
         "stages": stages,
         "components": components,
@@ -396,6 +426,38 @@ def _resolve_walk_filter(
         max_files=max_files if max_files is not None else cfg_walk.max_files,
         max_depth=max_depth if max_depth is not None else cfg_walk.max_depth,
     )
+
+
+def _auto_exclude_artifacts(flt: WalkFilter, *, root: Path, out: Path, config: Path | None) -> None:
+    """Append walk excludes that keep a build from indexing its own artifacts (#20 Bug 4).
+
+    The WalkFilter runs on root-relative POSIX paths, so we add patterns relative to ``root``:
+
+    * the output dir, when ``out`` resolves under the walk root (its prior ``*.indx`` / index.json
+      / chunks / embeddings would otherwise be re-swept on a rerun);
+    * the active ``indx.toml`` config, when it lives under the root (self-indexing the config);
+    * any in-tree ``*.indx`` archive (a sealed space dropped anywhere in the tree).
+
+    Patterns are appended (AND-combined as exclusions), so an explicit user ``--exclude`` still
+    applies; this only ever removes the tool's own footguns, never user content.
+    """
+    root_abs = root.resolve()
+    extra: list[str] = []
+    out_abs = out.resolve()
+    if out_abs == root_abs or out_abs.is_relative_to(root_abs):
+        rel = out_abs.relative_to(root_abs).as_posix()
+        # ``out`` == root is degenerate (everything is output); exclude nothing path-wise there.
+        if rel and rel != ".":
+            extra.append(f"{rel}/**")
+    if config is not None:
+        cfg_abs = config.resolve()
+        if cfg_abs.is_relative_to(root_abs):
+            extra.append(cfg_abs.relative_to(root_abs).as_posix())
+    extra += ["**/indx.toml", "**/*.indx"]
+    # De-dup while preserving order; keep any patterns the user already set.
+    for pat in extra:
+        if pat not in flt.exclude:
+            flt.exclude.append(pat)
 
 
 def _stage_subset(

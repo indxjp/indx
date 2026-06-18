@@ -45,6 +45,13 @@ _LABEL_TO_KIND: dict[str, str] = {
     "list_item": "text",
 }
 
+# Conversion-status names Docling reports for a usable result. An unsupported input format
+# (e.g. ``.odt``/``.rst``) does NOT raise — Docling returns a result whose ``status`` is
+# ``SKIPPED``/``FAILURE`` and whose document is empty. We compare by status *name* rather than
+# importing the vendor enum so the check stays a pure boundary guard (no vendor type leaks, §6.2)
+# and degrades safely on Docling shapes/fakes that expose no ``status`` at all.
+_OK_STATUS = frozenset({"SUCCESS", "PARTIAL_SUCCESS"})
+
 
 class DoclingParser:
     """Default parser backend built on Docling's :class:`DocumentConverter`.
@@ -98,6 +105,13 @@ class DoclingParser:
         except Exception as exc:  # vendor exception — translate at the edge (§8)
             raise StageError("parse", f"docling failed: {exc}", path=str(path)) from exc
 
+        # A non-success status is Docling's *non-raising* failure channel: an unsupported format
+        # yields a SKIPPED/FAILURE result with an empty document instead of an exception. Left
+        # unchecked it would flow through as an empty ParsedDoc — 0 chunks, silently unindexed,
+        # with parse_failures=0 (issue #17 bug 1). Surface it as a StageError so ResumableParseStage
+        # records a visible per-file skip (and --strict promotes it to fatal).
+        _raise_if_not_converted(result, path)
+
         # ``document`` is a DoclingDocument — a VENDOR type that must die inside this method.
         document = result.document
         blocks = self._to_blocks(document)
@@ -148,6 +162,35 @@ class DoclingParser:
             blocks.append(Block(kind=_kind_of(item), text=text, order=order))
             order += 1
         return blocks
+
+
+def _raise_if_not_converted(result: object, path: Path) -> None:
+    """Raise :class:`StageError` when Docling reports a non-success conversion ``status``.
+
+    Docling signals an unsupported/unreadable input by returning a result with a non-success
+    ``status`` (and an empty document) rather than raising. We translate that into the same
+    per-file skip a raised vendor error would produce. A result that exposes no ``status`` (older
+    Docling shapes / test fakes) is treated as success — this guard only ever adds failures that
+    Docling itself flagged.
+
+    Args:
+        result: The native ``ConversionResult`` (vendor type, never leaks out of this module).
+        path: The source path, for the error message.
+
+    Raises:
+        StageError: If ``result.status`` is present and not one of :data:`_OK_STATUS`.
+    """
+    status = getattr(result, "status", None)
+    if status is None:
+        return
+    status_name = str(getattr(status, "name", status)).upper()
+    if status_name in _OK_STATUS:
+        return
+    errors = getattr(result, "errors", None) or []
+    reason = "; ".join(str(getattr(e, "error_message", e)) for e in errors) or status_name
+    raise StageError(
+        "parse", f"docling could not convert ({status_name}): {reason}", path=str(path)
+    )
 
 
 def _iter_items(document: object) -> list[object]:
