@@ -37,6 +37,40 @@ function findOption(options: ComponentInfo[], value: string): ComponentInfo | un
   return options.find((o) => o.name === value);
 }
 
+/** The slot -> option-list map, derived once from a /components response. */
+function slotOptionsOf(comp: ComponentsResponse): Record<SlotKey, ComponentInfo[]> {
+  return {
+    parser: comp.parser,
+    llm: comp.llm,
+    vlm: comp.vlm,
+    embedder: comp.embedder,
+    store: comp.store,
+    output: comp.output,
+  };
+}
+
+/**
+ * Drop any slot value that names a NOT-installed backend down to the first installed backend in
+ * that slot (else '' = the server default). The inherited/default config may carry a cloud-stack
+ * backend this install lacks (e.g. parser=`docling`); selecting its disabled <option> assembles an
+ * invalid stack and 400s the dry-run (issue #22). A disabled <option> must never be the selected
+ * one. Provider-qualified values (`openai:gpt-5-mini`) and dotted writers (`.indx`) match no bare
+ * option name, so findOption misses and they are left untouched to round-trip as their own option.
+ */
+function sanitizeAgainstInstalled(values: SlotValues, comp: ComponentsResponse): SlotValues {
+  const slotOptions = slotOptionsOf(comp);
+  const sanitized = { ...values };
+  (Object.keys(slotOptions) as SlotKey[]).forEach((key) => {
+    const options = slotOptions[key];
+    const chosen = findOption(options, sanitized[key]);
+    if (chosen && !chosen.installed) {
+      const firstInstalled = options.find((o) => o.installed);
+      sanitized[key] = firstInstalled ? firstInstalled.name : '';
+    }
+  });
+  return sanitized;
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -100,7 +134,9 @@ export function ConfigTab() {
       .then(([comp, cfg]) => {
         setComponents(comp);
         const cfgObj = cfg.config as Record<string, unknown>;
-        setValues(valuesFromConfig(cfgObj));
+        // Never pre-select a backend this install lacks (e.g. cloud-default parser=docling); the
+        // disabled <option> would otherwise be the selected one and 400 the dry-run (issue #22).
+        setValues(sanitizeAgainstInstalled(valuesFromConfig(cfgObj), comp));
         const sub = storeSubTable(cfgObj);
         setBackendJson(JSON.stringify(sub, null, 2));
         const enrich = asRecord(cfgObj.enrich);
@@ -213,14 +249,21 @@ export function ConfigTab() {
   const applyDefaults = useCallback(() => {
     if (!components) return;
     const d = components.defaults;
-    setValues({
-      parser: d.parser ?? '',
-      llm: d.llm ?? '',
-      vlm: d.vlm ?? '',
-      embedder: d.embedder ?? '',
-      store: d.store ?? '',
-      output: d.output ?? '',
-    });
+    // Sanitize so an uninstalled cloud default (e.g. parser=docling) falls back to the
+    // first installed backend instead of selecting a disabled <option> (issue #22).
+    setValues(
+      sanitizeAgainstInstalled(
+        {
+          parser: d.parser ?? '',
+          llm: d.llm ?? '',
+          vlm: d.vlm ?? '',
+          embedder: d.embedder ?? '',
+          store: d.store ?? '',
+          output: d.output ?? '',
+        },
+        components,
+      ),
+    );
   }, [components]);
 
   // ----------------------------------------------------------------- metadata
@@ -254,14 +297,7 @@ export function ConfigTab() {
     return <p className="text-sm text-slate-500">Loading components…</p>;
   }
 
-  const slotOptions: Record<SlotKey, ComponentInfo[]> = {
-    parser: components.parser,
-    llm: components.llm,
-    vlm: components.vlm,
-    embedder: components.embedder,
-    store: components.store,
-    output: components.output,
-  };
+  const slotOptions = slotOptionsOf(components);
 
   return (
     <div className="space-y-5">

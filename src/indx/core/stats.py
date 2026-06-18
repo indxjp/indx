@@ -20,3 +20,5 @@ class SpaceStats(BaseModel):
     embed_dim: int | None = None
     types: dict[str, int] = Field(default_factory=dict)
     bytes_source: int = 0
+    unindexed_documents: int = 0
+    unindexed_paths: list[str] = Field(default_factory=list)

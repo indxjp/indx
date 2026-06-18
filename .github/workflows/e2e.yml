@@ -224,7 +224,11 @@ jobs:
         include:
           - backend: markitdown
             extra: markitdown
-            tests: tests/extras/test_parsers.py::test_markitdown_build
+            # Run the whole parsers file: it covers the HTML happy path AND the real binary
+            # office-doc round-trip (#20). The docling/unstructured tests self-skip (requires_lib)
+            # since this leg installs only indx[markitdown]; its office sub-extras let the .docx/
+            # .pptx test really parse rather than self-skip.
+            tests: tests/extras/test_parsers.py
           - backend: docling
             extra: docling
             tests: tests/extras/test_parsers.py::test_docling_build

@@ -116,6 +116,8 @@ def test_inspect_json_emits_full_space_stats(tmp_path: Path) -> None:
         "embed_dim",
         "types",
         "bytes_source",
+        "unindexed_documents",
+        "unindexed_paths",
     }
     assert stats["documents"] == 2
     assert stats["bytes_source"] > 0  # sum of document size_bytes
@@ -172,13 +174,14 @@ def test_query_k_negative_is_usage_error(tmp_path: Path) -> None:
 
 
 def test_build_json_carries_parse_failures(tmp_path: Path) -> None:
-    """H1: ``build --json`` includes an integer ``parse_failures`` count."""
+    """H1: ``build --json`` includes an integer ``unindexed_documents`` count."""
     src = _src(tmp_path)
     out = tmp_path / "space.indx"
     result = runner.invoke(app, ["build", str(src), "--out", str(out), "--json", *OFFLINE])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["parse_failures"] == 0
+    assert payload["unindexed_documents"] == 0
+    assert "unindexed_paths" in payload
 
 
 def test_build_warns_on_parse_failures_exit_0(tmp_path: Path, monkeypatch) -> None:
@@ -198,6 +201,40 @@ def test_build_warns_on_parse_failures_exit_0(tmp_path: Path, monkeypatch) -> No
     result = runner.invoke(app, ["build", str(src), "--out", str(out), *OFFLINE])
     assert result.exit_code == 0, result.output
     assert "2 file(s) could not be parsed" in result.stdout
+    # #20 Bug 3: the format-extra names are bracketed (``markitdown[docx]``, ``indx[docling]``)
+    # and must be ``escape``d so Rich does not eat them as console markup — the user has to see
+    # the actual extra name to act on the hint.
+    assert "markitdown[docx]" in result.stdout
+    assert "indx[docling]" in result.stdout
+
+
+def test_rerun_does_not_index_its_own_output_or_config(tmp_path: Path) -> None:
+    """#20 Bug 4: a build whose ``--out`` is inside the indexed tree must not sweep its own
+
+    prior artifacts (or the active ``indx.toml``) back in on a rerun. The walk auto-excludes the
+    in-tree output dir, the config, and any ``*.indx``, so the doc count stays at the real source
+    files across reruns instead of ballooning with index.json / chunks / embeddings.
+    """
+    src = _src(tmp_path)  # 2 real source files (notes/alpha.md, beta.md)
+    (src / "indx.toml").write_text("[parser]\nengine = 'plaintext'\n")
+    out = src / "out"  # output lands INSIDE the walk root — the footgun
+
+    def _build() -> dict:
+        result = runner.invoke(
+            app, ["build", str(src), "--out", str(out), "--json", "--format", "jsonl", *OFFLINE]
+        )
+        assert result.exit_code == 0, result.output
+        return json.loads(result.stdout)
+
+    first = _build()
+    # First pass sees only the 2 source files: out/ does not exist yet and indx.toml is excluded.
+    assert first["counts"]["docs"] == 2
+    assert not any(p.endswith("indx.toml") for p in first.get("unindexed_paths", []))
+
+    # Rerun: out/ now holds the previous build's artifacts. Without the guard these would be
+    # indexed as documents; with it, the count is unchanged.
+    second = _build()
+    assert second["counts"]["docs"] == 2
 
 
 def test_missing_archive_exits_4(tmp_path: Path) -> None:

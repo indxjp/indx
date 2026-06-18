@@ -18,6 +18,11 @@ class MissingExtraError(IndxError):
     The message always names the exact ``pip install indx[...]`` to run (file-architecture §5).
     """
 
+    # Dedup sentinel: set by DirectoryPipeline when it has already appended the offline-mode hint
+    # note, so the CLI build handler does not append it a second time. Declared here so setting it
+    # is type-clean (mypy attr-defined) and the contract is discoverable.
+    _offline_hint_added: bool = False
+
     def __init__(self, slot: str, name: str, extra: str) -> None:
         self.slot = slot
         self.name = name

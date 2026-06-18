@@ -100,6 +100,11 @@ class KnowledgeSpace(BaseModel):
     # (parse-stage "skip" errors this build). Never persisted (``exclude=True``) so archive
     # byte-determinism is preserved. Surfaced as a yellow warning by build.py / crud.py.
     parse_failures_: int = Field(default=0, exclude=True)
+    # Run telemetry only — root-relative paths of docs whose extracted text looks like structured
+    # markup/data (pandoc-AST JSON, LaTeX, notebook JSON, …) rather than prose, so they were chunked
+    # as raw tag soup that poisons retrieval (#14 N6). Never persisted (``exclude=True``) so archive
+    # byte-determinism is preserved. Surfaced as a yellow warning by build.py / crud.py.
+    markup_paths_: list[str] = Field(default_factory=list, exclude=True)
 
     # Non-serialized runtime state (Feature 2) — never written to the archive.
     # ``_source_path`` is the archive this space was read from (base dir for relative child
@@ -146,6 +151,8 @@ class KnowledgeSpace(BaseModel):
         base = self.flatten() if self.manifest.children else self
         types: Counter[str] = Counter(d.doc_type or "unknown" for d in base.documents_)
         embeddings = sum(1 for c in base.chunks if c.embedding is not None)
+        doc_ids_with_chunks = {c.doc_id for c in base.chunks}
+        unindexed_docs = [d for d in base.documents_ if d.id not in doc_ids_with_chunks]
         return SpaceStats(
             documents=len(base.documents_),
             chunks=len(base.chunks),
@@ -154,6 +161,8 @@ class KnowledgeSpace(BaseModel):
             embed_dim=base.manifest.embedding_dim,
             types=dict(types),
             bytes_source=sum(d.size_bytes for d in base.documents_),
+            unindexed_documents=len(unindexed_docs),
+            unindexed_paths=[d.path for d in unindexed_docs],
         )
 
     def search(self, query: str, k: int = 5) -> list[SearchHit]:
@@ -603,6 +612,8 @@ class KnowledgeSpace(BaseModel):
         # Surface files that reached the parse stage but produced 0 chunks (H1). IngestResult
         # carries the count from ingest_path; build.py/crud.py render it as a yellow warning.
         self.parse_failures_ = result.parse_failures
+        # Likewise surface docs whose text is structured markup/data, not prose (#14 N6).
+        self.markup_paths_ = result.markup_paths
 
         # Guard BEFORE mutating any row list: if the space already records an embedder, a CRUD-add
         # that embeds with a different width (or a different model) would silently append
@@ -838,7 +849,15 @@ class KnowledgeSpace(BaseModel):
         from indx.core.parsed import Block, ParsedDoc
         from indx.pipeline.stages.relate import RelateStage
 
-        ctx = SpaceContext(root=Path("."))
+        # ``RelateStage._references`` reads the *raw source file* (``ctx.root / doc.path``) for
+        # textual extensions to recover link targets a normalizing parser (docling) strips from
+        # the parsed text. That read must resolve against the indexed root, not the cwd, or the
+        # CRUD reseal silently loses every ``references`` edge a fresh build emits — diverging
+        # from the "build then add seals byte-identically to a single full build" contract. Fall
+        # back to ``.`` only when no source root is recorded (the ``OSError`` fallback to chunk
+        # text then preserves prior behavior for archives whose source is gone).
+        root = Path(self.manifest.source_root) if self.manifest.source_root else Path(".")
+        ctx = SpaceContext(root=root)
         ctx.space.documents_ = sorted(self.documents_, key=lambda d: d.path)
         chunks_by_doc: dict[str, list[Chunk]] = {}
         for c in sorted(self.chunks, key=lambda c: c.position):

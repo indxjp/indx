@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 from indx.archive import format as fmt
-from indx.archive.writer import write_archive
+from indx.archive.writer import projected_documents, write_archive
 from indx.core.knowledge_space import KnowledgeSpace
 from indx.errors import IndxError
 
@@ -55,7 +55,10 @@ def _write_index_json(space: KnowledgeSpace, path: Path) -> None:
         "root": space.manifest.source_root,
         "metadata": space.manifest.model_dump(),
         "stats": _stats(space),
-        "documents": [d.model_dump() for d in space.documents_],
+        # Same serialize-time projection the .indx archive uses, so index.json and the archive's
+        # documents member agree: chunk_ids / references / referenced_by are backfilled rather than
+        # shipped empty from the raw in-memory docs no stage fills (issue #17 bug 3 / #14 N3).
+        "documents": list(projected_documents(space)),
         "chunks": [c.model_dump(exclude={"embedding"}) for c in space.chunks],
         "relations": [r.model_dump(mode="json") for r in space.relations],
     }

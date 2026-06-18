@@ -62,6 +62,32 @@ def test_markdown_extension_detected() -> None:
     assert out.doc_type == "markdown"
 
 
+def test_binary_origin_keeps_source_type_despite_markdown_headings() -> None:
+    """A docx/html parsed to markdown-with-#-headings keeps its source type, not "markdown".
+
+    Regression for issue #22: markitdown renders ``.docx``/``.html`` to markdown with ``#``
+    headings, which used to trip the heading heuristic and collapse the type to "markdown".
+    The source extension is authoritative for binary/markup origins.
+    """
+    docx = _enrich(
+        Document(id="d", path="docs/architecture.docx"),
+        _parsed(Block(kind="heading", text="# Architecture", order=0)),
+    )
+    html = _enrich(
+        Document(id="h", path="docs/deployment.html"),
+        _parsed(Block(kind="heading", text="# Deployment", order=0)),
+    )
+    assert docx.doc_type == "document"
+    assert html.doc_type == "webpage"
+
+
+def test_pdf_with_headings_keeps_pdf_type() -> None:
+    """A heading-bearing PDF stays "pdf" rather than degrading to "markdown" (issue #22)."""
+    doc = Document(id="d1", path="manual.pdf")
+    parsed = _parsed(Block(kind="heading", text="# Manual", order=0))
+    assert _enrich(doc, parsed).doc_type == "pdf"
+
+
 def test_lineage_keyword_classifies_contract() -> None:
     doc = Document(id="d1", path="legal/msa.pdf", lineage=["legal", "contracts"])
     out = _enrich(doc, _parsed(Block(text="terms and conditions", order=0)))

@@ -55,26 +55,53 @@ def _save_target(space: Path | None, loaded: KnowledgeSpace) -> str:
     return str(archive)
 
 
+def _resolves_under_root(path: Path, source_root: str) -> bool:
+    """True if ``path`` resolves under the space's ``source_root`` (mirrors _resolve_add_target).
+
+    Uses the same candidate resolution as :meth:`KnowledgeSpace._resolve_add_target`: an absolute
+    target is checked as-is; a relative one is tried against the CWD and against the source root
+    (the SDK convention). When it falls under the root, the in-root ingest succeeds and needs no
+    staging; otherwise the caller stages the external target instead of failing (#14 N5).
+    """
+    root = Path(source_root)
+    if not root.is_dir():
+        return False
+    root_resolved = root.resolve()
+    target = Path(path)
+    candidates = [target] if target.is_absolute() else [Path.cwd() / target, root / target]
+    for cand in candidates:
+        try:
+            cand.resolve().relative_to(root_resolved)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 @contextmanager
 def _ingest_arg(space: Path | None, loaded: KnowledgeSpace, path: Path) -> Iterator[str]:
-    """Yield the ingest argument for ``add``/``update``, staging home targets (Feature 4).
+    """Yield the ingest argument for ``add``/``update``, staging out-of-root targets (Feature 4).
 
-    An explicit space ingests ``path`` under its own ``manifest.source_root`` (Feature 3,
-    unchanged — no rebind, no staging). The home space, however, must accept a file/dir from
-    *anywhere*: its ``source_root`` (``$INDX_HOME``) is not where a user's documents live, and
-    pointing the ingest walk at an arbitrary parent (e.g. ``/tmp``) would crawl unrelated files.
-    So a home target is rebound onto an isolated walk root:
+    A target already **under** the space's ``manifest.source_root`` ingests in place (Feature 3,
+    unchanged — no rebind, no staging — so its lineage/relative path and the deterministic reseal
+    are preserved exactly). But a target from *anywhere else* must still be ingestible: the home
+    space's ``source_root`` (``$INDX_HOME``) is never where documents live, and the README markets
+    ``indx add ./notes/standup.md some.indx`` as general incremental ingestion (#14 N5). Pointing
+    the ingest walk at an arbitrary parent (e.g. ``/tmp``) would crawl unrelated files, so an
+    out-of-root target is rebound onto an isolated walk root:
 
     * a **file** is copied into a fresh temp dir whose only member is that file, so the ingest
       walks just it and ``Document.path`` is the bare basename;
     * a **directory** is used directly as the root (its tree is the intended corpus).
 
     The space's ``manifest.source_root`` is rebound to the chosen root only for the duration of the
-    mutation, then restored to its original value (``$INDX_HOME``) so the resealed home manifest
-    never persists a transient walk root — in particular not a temp dir that no longer exists. The
-    temp dir (if any) is removed on exit.
+    mutation, then restored to its original value, so the resealed manifest never persists a
+    transient walk root — in particular not a temp dir that no longer exists. The temp dir (if any)
+    is removed on exit.
     """
-    if space is not None:
+    # An explicit archive ingests an in-root target verbatim (the original Feature 3 path); the
+    # home space (space is None) always stages, since its source_root is not the document tree.
+    if space is not None and _resolves_under_root(path, loaded.manifest.source_root):
         yield str(path)
         return
 
@@ -88,7 +115,7 @@ def _ingest_arg(space: Path | None, loaded: KnowledgeSpace, path: Path) -> Itera
             loaded.manifest.source_root = original_source_root
         return
 
-    staged = Path(tempfile.mkdtemp(prefix="indx-home-add-"))
+    staged = Path(tempfile.mkdtemp(prefix="indx-add-"))
     try:
         shutil.copy2(abs_path, staged / abs_path.name)
         loaded.manifest.source_root = str(staged)
@@ -119,6 +146,7 @@ def add_command(
             "changed": changed,
             "added": {"docs": added_docs, "chunks": added_chunks},
             "parse_failures": loaded.parse_failures_,
+            "markup_paths": loaded.markup_paths_,
         }
         console.print_json(json.dumps(payload))
         return
@@ -135,6 +163,7 @@ def add_command(
             f"[bold]{escape(archive)}[/bold]"
         )
         _warn_parse_failures(loaded.parse_failures_)
+        _warn_markup_docs(loaded.markup_paths_)
         return
     console.print(
         f"[green]✓[/green] added {len(changed)} doc(s) "
@@ -143,6 +172,8 @@ def add_command(
     )
     # H1: surface any files that reached the parse stage but yielded 0 chunks.
     _warn_parse_failures(loaded.parse_failures_)
+    # N6: surface any files indexed as raw structured markup rather than prose.
+    _warn_markup_docs(loaded.markup_paths_)
 
 
 def _warn_parse_failures(parse_failures: int) -> None:
@@ -151,6 +182,17 @@ def _warn_parse_failures(parse_failures: int) -> None:
         console.print(
             f"[yellow]![/yellow] {parse_failures} file(s) could not be parsed and were "
             "indexed with 0 chunks (try a richer parser, e.g. indx[docling])"
+        )
+
+
+def _warn_markup_docs(markup_paths: list[str]) -> None:
+    """Warn (yellow, exit 0) when files were indexed as raw structured markup, not prose (N6)."""
+    if markup_paths:
+        shown = ", ".join(markup_paths[:3]) + (" …" if len(markup_paths) > 3 else "")
+        console.print(
+            f"[yellow]![/yellow] {len(markup_paths)} file(s) look like structured markup/data, "
+            f"not prose, and were indexed as raw markup ({escape(shown)}) — retrieval quality "
+            "may suffer; consider a format-aware parser or excluding them"
         )
 
 

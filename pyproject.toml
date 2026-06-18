@@ -44,7 +44,7 @@ indx = "indx.cli.app:app"
 docling      = ["docling"]
 unstructured = ["unstructured"]
 llamaparse   = ["llama-cloud-services"]
-markitdown   = ["markitdown[pdf]"]
+markitdown   = ["markitdown[pdf,docx,pptx,xlsx,outlook]"]
 ollama       = ["ollama"]
 vllm         = ["vllm", "openai"]
 openai       = ["openai"]
@@ -117,7 +117,11 @@ all          = ["indx[docling]", "indx[unstructured]", "indx[llamaparse]", "indx
                 "indx[mcp]", "indx[pydantic-ai]", "indx[openai-agents]", "indx[claude-agent]",
                 "indx[aws]", "indx[aws-opensearch]",
                 "indx[gcp]", "indx[gcp-vectorsearch]"]
-dev          = ["pytest>=8", "pytest-cov", "mypy", "ruff", "nox", "numpy", "pyyaml"]
+# ``python-docx`` is a *test-fixture writer* only: tests/extras/test_parsers.py builds a tiny
+# real .docx at test time to drive the markitdown binary-office round-trip (#20). markitdown[docx]
+# reads .docx via mammoth (not python-docx), so this lib is needed to *create* the fixture; the
+# extras CI leg installs ``.[markitdown,dev]`` so the docx case runs rather than self-skips.
+dev          = ["pytest>=8", "pytest-cov", "mypy", "ruff", "nox", "numpy", "pyyaml", "python-docx"]
 
 # --- First-party slot registrations advertised as entry points (registry discovers these). ---
 # Mirrors registry/builtins.py exactly so plugin/name-resolution parity holds (file-architecture §6).

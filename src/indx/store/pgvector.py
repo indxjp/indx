@@ -65,10 +65,16 @@ class PgVectorStore:
         # statement so merely importing this module stays safe (coding-standards §6.3).
         require_extra("store", "pgvector", "pgvector", "psycopg")
         import psycopg  # type: ignore[import-not-found]  # optional extra: pgvector
+        from pgvector import Vector  # type: ignore[import-not-found]  # optional extra: pgvector
         from pgvector.psycopg import (  # type: ignore[import-not-found]  # optional extra: pgvector
             register_vector,
         )
 
+        # ``register_vector`` only teaches psycopg to adapt ``pgvector.Vector`` (and numpy
+        # arrays) to the ``vector`` column — a plain ``list[float]`` is adapted as a Postgres
+        # ``double precision[]`` and rejected by both the column and the ``<=>`` operator. Wrap
+        # every vector param in ``Vector`` at the edge; stash the class so upsert/search reuse it.
+        self._Vector = Vector
         self.dim = dim
         # Set before the try so a failure mid-setup still leaves a well-defined attr
         # and the except block can release a half-open connection (no orphaned socket).
@@ -127,7 +133,7 @@ class PgVectorStore:
         )
 
         ready = [c for c in chunks if c.embedding is not None]
-        rows = [(c.id, c.embedding, Jsonb(_chunk_to_payload(c))) for c in ready]
+        rows = [(c.id, self._Vector(c.embedding), Jsonb(_chunk_to_payload(c))) for c in ready]
         if not rows:
             return
         try:
@@ -185,7 +191,8 @@ class PgVectorStore:
             f"FROM {_TABLE} ORDER BY embedding <=> %s LIMIT %s"
         )
         try:
-            rows = self._conn.execute(sql, (vector, vector, k)).fetchall()
+            qv = self._Vector(vector)
+            rows = self._conn.execute(sql, (qv, qv, k)).fetchall()
         except Exception as exc:
             raise StageError("store", str(exc)) from exc
         hits = [SearchHit(_row_to_chunk(row), float(row[2])) for row in rows]

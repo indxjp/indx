@@ -221,6 +221,25 @@ def test_build_sse_offline_streams_stages_and_done(
     assert done["components"]["store"] == "jsonl"
 
 
+def test_build_writes_exactly_one_archive_named_for_request(
+    client: TestClient, corpus: Path, tmp_path: Path
+) -> None:
+    """The app build path serializes the archive once, named ``f"{req.name}.indx"`` (issue #22).
+
+    The build previously wrote twice — ``run()`` sealed a default ``handbook.indx`` *and* the
+    explicit writer wrote ``<name>.indx`` — breaking ``_resolve_export_path``'s single-archive
+    invariant. Assert one ``*.indx`` carrying the requested name.
+    """
+    out = tmp_path / "ks"
+    events = _sse_events(
+        client,
+        {"directory": str(corpus), "out": str(out), "offline": True, "name": "corpus"},
+    )
+    assert "done" in [e for e, _ in events] and "error" not in [e for e, _ in events]
+    archives = sorted(p.name for p in out.glob("*.indx"))
+    assert archives == ["corpus.indx"]
+
+
 def test_build_sse_dry_run_emits_single_plan_event(client: TestClient, corpus: Path) -> None:
     """``dry_run: true`` is terminal with a single ``plan`` event (no models run)."""
     events = _sse_events(client, {"directory": str(corpus), "offline": True, "dry_run": True})
@@ -244,6 +263,55 @@ def test_dry_run_endpoint(client: TestClient, corpus: Path) -> None:
     assert isinstance(body["folders"], list)
 
 
+def test_dry_run_missing_directory_returns_400(client: TestClient, tmp_path: Path) -> None:
+    """A non-directory path yields a clean 400, not a 500 (issue #24).
+
+    ``plan()`` raises a bare stdlib ``NotADirectoryError``/``FileNotFoundError`` for a path that
+    isn't a dir/zip; the endpoint must map it to a 4xx like /build and /inspect already do.
+    """
+    missing = tmp_path / "nope-dir"
+    resp = client.post("/api/dry-run", json={"directory": str(missing), "offline": True})
+    assert resp.status_code == 400, resp.text
+
+
+def test_config_put_rejects_unknown_section(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wrong-shaped body (unknown top-level section) is rejected, not silently defaulted.
+
+    Regression for issue #24: ``Config`` is ``extra="allow"`` for ``[store.<backend>]`` sub-tables,
+    so a body like ``{"preset": "local"}`` would otherwise validate, drop ``preset``, and persist a
+    full *default* config over the user's saved stack. Assert a 422 and that no file was written.
+    """
+    monkeypatch.chdir(tmp_path)
+    resp = client.put("/api/config", json={"config": {"preset": "local"}})
+    assert resp.status_code == 422, resp.text
+    assert "preset" in str(resp.json()["detail"])
+    assert not (tmp_path / "indx.toml").exists()  # no clobber
+
+
+def test_inject_space_collection_derives_per_space_name(tmp_path: Path) -> None:
+    """Each Qdrant build gets a collection named for its output dir, unless one is pinned."""
+    from indx.app.api import _inject_space_collection
+    from indx.config import load_config
+
+    out = tmp_path / "indx-app-6mh0erv8"
+    cfg = load_config(None, overrides={"store": "qdrant"})
+    _inject_space_collection(cfg, out)
+    assert cfg.store.options().get("collection") == "indx-app-6mh0erv8"
+
+    # An explicit pin wins; injection is a no-op.
+    pinned = load_config(None, overrides={"store": "qdrant"})
+    pinned.store.qdrant = {"collection": "mine"}
+    _inject_space_collection(pinned, out)
+    assert pinned.store.options().get("collection") == "mine"
+
+    # Non-qdrant backends are untouched.
+    jsonl = load_config(None, overrides={"store": "jsonl"})
+    _inject_space_collection(jsonl, out)
+    assert "collection" not in jsonl.store.options()
+
+
 # --------------------------------------------------------------------------- inspect
 
 
@@ -262,6 +330,8 @@ def test_inspect_built_space(client: TestClient, corpus: Path, tmp_path: Path) -
         "embed_dim",
         "types",
         "bytes_source",
+        "unindexed_documents",
+        "unindexed_paths",
     }
     assert len(body["documents"]) == done["counts"]["docs"]
     assert {"id", "type", "path", "folder", "topics", "tags", "chunks"} <= set(body["documents"][0])

@@ -47,9 +47,9 @@ _DEFAULT_METADATA: tuple[str, ...] = (_META_TYPE, _META_TOPICS, _META_TAGS, _MET
 # falls back to the single character for a length-1 run. This keeps topics deterministic and
 # stdlib-only (no jieba/mecab) while producing word-ish (not per-ideograph) Japanese/Chinese/Korean
 # topics. The Latin branch is matched verbatim and emitted as-is.
-_CJK_RUN = r"[぀-ヿ㐀-鿿가-힣]+"
+_CJK_RUN = r"[぀-ヿ･-ﾟ㐀-鿿\U00020000-\U0002a6df가-힣ᄀ-ᇿ]+"
 _WORD = re.compile(r"[a-z][a-z0-9]{3,}|" + _CJK_RUN)
-_CJK_CHAR = re.compile(r"[぀-ヿ㐀-鿿가-힣]")
+_CJK_CHAR = re.compile(r"[぀-ヿ･-ﾟ㐀-鿿\U00020000-\U0002a6df가-힣ᄀ-ᇿ]")
 
 
 def _tokenize(text: str) -> list[str]:
@@ -262,9 +262,12 @@ class EnrichStage:
         """Classify a document from extension, lineage and content cues (deterministic).
 
         Precedence: a role named in the folder lineage (e.g. ``contracts/``) wins, because the
-        author filed it there deliberately; otherwise a structural extension type (spreadsheet,
-        image, …) or markdown heading structure; finally a content cue; falling back to the bare
-        extension type or ``"unknown"``.
+        author filed it there deliberately; otherwise a strong structural extension type
+        (spreadsheet, image, …). For a non-text source extension (``document``/``webpage``/``pdf``
+        …) that extension is then authoritative — its parsed-to-markdown rendering must not be
+        mistaken for markdown (issue #22). Only genuinely text/markdown inputs fall through to the
+        markdown heading-structure heuristic, then a content cue, then the bare extension type or
+        ``"unknown"``.
         """
         ext_type = _ext_type(path)
 
@@ -279,7 +282,17 @@ class EnrichStage:
         if ext_type in _STRONG_TYPES:
             return ext_type
 
-        # 3. Markdown with heading structure (from extension or detected heading blocks).
+        # A binary or markup origin (``.docx``/``.html``/``.pdf``) that the parser rendered to
+        # markdown-with-``#``-headings must NOT be mistaken for markdown (issue #22): its source
+        # extension type (``document``/``webpage``/``pdf``) is authoritative. The heading-structure
+        # and content-cue heuristics below run only for genuinely text/markdown inputs. An empty
+        # ``ext_type`` (no/unknown extension) counts as text-like so heading-bearing extension-less
+        # docs still classify as markdown.
+        if ext_type not in ("markdown", "text", ""):
+            # 3. Non-text source extension is authoritative for binary/markup origins.
+            return ext_type
+
+        # 4. Markdown with heading structure (from extension or detected heading blocks).
         has_heading = any(b.kind == "heading" for b in parsed.blocks)
         lead = _lead(parsed.text)
         if ext_type == "markdown" or has_heading or lead.lstrip().startswith("#"):
@@ -287,12 +300,12 @@ class EnrichStage:
             # A README/meeting markdown doc keeps its more specific role.
             return cue if cue is not None else "markdown"
 
-        # 4. Lightweight content cues for plain/unknown types.
+        # 5. Lightweight content cues for plain/unknown text inputs.
         cue = _content_cue(lead)
         if cue is not None:
             return cue
 
-        # 5. Fall back to whatever the extension implies, else unknown.
+        # 6. Fall back to whatever the extension implies, else unknown.
         return ext_type or "unknown"
 
     def _topics(self, text: str) -> list[str]:

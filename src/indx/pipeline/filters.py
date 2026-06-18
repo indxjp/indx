@@ -159,7 +159,18 @@ class WalkFilter(BaseModel):
         name = rel.name
         if self.max_depth is not None and depth > self.max_depth:
             return False
-        if self.ext and rel.suffix.lower() not in self.ext:
+        # name + ext are AND-combined; extensionless files bypass the ext check when name matches
+        name_match = bool(
+            self.name and any(fnmatch.fnmatch(name, g) or g in name for g in self.name)
+        )
+        if self.ext:
+            # Ext failed, with no extensionless-file bypass (a file with no suffix explicitly
+            # matched by name — Dockerfile, Makefile, etc.) — drop it. When ext passes (or the
+            # bypass applies) the name check is skipped, since name+ext are AND-combined.
+            if rel.suffix.lower() not in self.ext and not (name_match and not rel.suffix):
+                return False
+        elif self.name and not name_match:
+            # No ext filter — name filter applies as a standalone AND predicate
             return False
         if self.min_size is not None and size_bytes < self.min_size:
             return False
@@ -167,6 +178,4 @@ class WalkFilter(BaseModel):
             return False
         if self.include and not any(_path_match(rel_str, g) for g in self.include):
             return False
-        if self.exclude and any(_path_match(rel_str, g) for g in self.exclude):
-            return False
-        return not (self.name and not any(fnmatch.fnmatch(name, g) or g in name for g in self.name))
+        return not (self.exclude and any(_path_match(rel_str, g) for g in self.exclude))

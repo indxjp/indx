@@ -311,20 +311,50 @@ def _components_of(cfg: Config) -> dict[str, str]:
     }
 
 
+def _inject_space_collection(cfg: Config, out: Path | None) -> None:
+    """Give each app build its own Qdrant collection so corpora never cross-contaminate.
+
+    A Qdrant collection is a global namespace: every directory ever indexed into the default
+    ``indx`` collection piles into one bucket, and an Ask against it blends every corpus
+    (issue #24, 1b). When the build targets a known output dir, derive a per-space collection
+    name from that dir's basename (e.g. ``indx-app-6mh0erv8``) and inject it into the
+    ``[store.qdrant]`` sub-table — unless the user already pinned ``collection`` explicitly,
+    which always wins. Only applies to the ``qdrant`` backend; other stores ignore it.
+    """
+    if out is None or cfg.store.backend != "qdrant":
+        return
+    if "collection" in cfg.store.options():  # an explicit pin wins
+        return
+    name = out.resolve().name
+    if not name:
+        return
+    sub = getattr(cfg.store, "qdrant", None)
+    if isinstance(sub, dict):
+        sub["collection"] = name
+    else:
+        cfg.store.qdrant = {"collection": name}  # type: ignore[attr-defined]  # extra="allow" sub-table
+
+
 def _make_pipeline(req: BuildRequest, cfg: Config, out: Path | None) -> Any:
     """Construct a :class:`DirectoryPipeline` from a resolved config (mirrors build_command).
 
     ``out`` may be ``None`` for a dry-run: ``plan`` walks only and never writes, so there is no
     point allocating (and then leaking) a temp output dir for it.
+
+    The resolved ``cfg`` is threaded in as ``config=`` so the build honors the ``--config`` file
+    the app launched with (and its ``[store.<backend>]`` sub-tables) rather than re-reading
+    ``./indx.toml`` from the server CWD.
     """
     from indx.pipeline import DirectoryPipeline
 
+    _inject_space_collection(cfg, out)
     return DirectoryPipeline(
         parser=cfg.parser.engine,
         llm=cfg.enrich.llm,
         vlm=cfg.enrich.vlm,
         embedder=cfg.embed.model,
         store=cfg.store.backend,
+        config=cfg,
         embed=not req.no_embed,
         resume=req.resume,
         jobs=req.jobs,
@@ -362,7 +392,11 @@ def _run_build_summary(
         if on_stage is not None:
             on_stage(stage_name)
 
-    space = pipeline.run(directory, on_stage=timed_stage)
+    # ``out=None`` keeps ``run()`` in-memory so the explicit ``get_writer(...).write`` below is the
+    # *single* serialization (with ``name`` authoritative). The pipeline was constructed with
+    # ``out=`` (so ``--resume``'s StageCache still lives under that dir), and omitting ``out`` here
+    # would seal a second, default-named (``handbook``) archive — the double-write of issue #22.
+    space = pipeline.run(directory, out=None, on_stage=timed_stage)
     stages_end = time.perf_counter()
     get_writer(writer_slot).write(space, out, name=name)
     end = time.perf_counter()
@@ -540,6 +574,18 @@ def build_router() -> APIRouter:
     def config_put(body: ConfigPutRequest) -> ConfigGetResponse:
         from pydantic import ValidationError
 
+        # Top-level ``Config`` is ``extra="allow"`` (intentional, for ``[store.<backend>]``
+        # sub-tables), so a typo'd/wrong-shaped body would otherwise validate, drop its unknown
+        # keys, and persist a *default* config over the user's saved stack — silent data loss
+        # (issue #24). Reject unknown top-level sections here, in the app layer, without
+        # loosening the core schema.
+        if isinstance(body.config, dict):
+            unknown = set(body.config) - set(Config.model_fields)
+            if unknown:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"unknown config section(s): {sorted(unknown)}",
+                )
         try:
             cfg = Config.model_validate(body.config)
         except ValidationError as exc:
@@ -621,7 +667,11 @@ def build_router() -> APIRouter:
             # allocated — the non-streaming dry-run used to leak one temp dir per request).
             pipeline = _make_pipeline(req, cfg, None)
             plan = pipeline.plan(Path(req.directory))
-        except IndxError as exc:
+        except (IndxError, OSError) as exc:
+            # ``plan() -> _new_context()`` raises a bare stdlib ``NotADirectoryError`` /
+            # ``FileNotFoundError`` (both ``OSError``) for a path that isn't a dir/zip; without
+            # this they escape as a 500. ``/api/build`` and ``/api/inspect`` already return a
+            # clean 4xx for the same input — this makes dry-run consistent (issue #24).
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return DryRunResponse(
             root=str(plan.root),

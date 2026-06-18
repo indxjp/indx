@@ -270,7 +270,7 @@ Every connector exposes the same three read-only tools — **search**, **overvie
 
 ## Status
 
-Alpha (`0.0.6`). The zero-dependency core path (`plaintext` → `hash` → `jsonl` → `.indx`)
+Alpha (`0.0.7`). The zero-dependency core path (`plaintext` → `hash` → `jsonl` → `.indx`)
 runs end to end and is fully air-gapped — reach it with `indx demo` or `--offline`. The
 optional cloud/local backends (docling, openai, ollama, bge-m3, qdrant, plus the managed
 AWS/Azure/GCP profiles, …) are implemented and selected through the registry: install the

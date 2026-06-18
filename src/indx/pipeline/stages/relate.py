@@ -18,6 +18,7 @@ content-derived edges.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 
 from indx.core.context import SpaceContext
@@ -43,12 +44,25 @@ _MD_LINK = re.compile(r"\]\(\s*<?([^)>\s]+)>?(?:\s+[^)]*)?\)")
 # Whitespace runs collapse to a single space when normalizing text for duplicate detection.
 _WS = re.compile(r"\s+")
 
+# Maximum group size for pairwise SIBLING emission. A flat directory at or below this size gets
+# the full symmetric pairing; ABOVE it, pairwise emission is O(n^2) (a 500-file folder is already
+# ~125k edges), so we degrade gracefully to a bounded per-doc neighbourhood instead of either
+# exploding or — as before — silently emitting ZERO sibling edges for the whole folder (#14 N4).
+SIBLING_MAX = 500
+# Above SIBLING_MAX, each doc links to its next k path-adjacent siblings (the group is path
+# sorted, so this is deterministic). Bounds the edge count at ~k*n while keeping every large
+# folder some local sibling structure rather than none.
+SIBLING_NEIGHBORS = 8
+
+_log = logging.getLogger(__name__)
+
 
 class RelateStage:
     name = "relate"
 
     def run(self, ctx: SpaceContext) -> SpaceContext:
         docs = ctx.space.documents_
+        with_content = _docs_with_content(ctx)
         rels: list[Relation] = []
         by_folder: dict[tuple[str, ...], list[Document]] = {}
         for d in docs:
@@ -56,10 +70,14 @@ class RelateStage:
 
         for group in by_folder.values():
             group = sorted(group, key=lambda d: d.path)
-            # sibling: every ordered pair in the same folder (high precision, symmetric pairs)
-            for i, a in enumerate(group):
-                for b in group[i + 1 :]:
-                    rels.append(Relation(src=a.id, dst=b.id, type=RelationType.SIBLING))
+            # sibling: pair documents in the same folder, but exclude 0-chunk shells (binaries,
+            # empty/whitespace files) — they are non-retrievable and pairing them is pure noise
+            # (#14 N4). When content is unknown (Relate run standalone after Walk only), keep the
+            # full group so the purely-structural relate path is unchanged.
+            sib_group = (
+                group if with_content is None else [d for d in group if d.id in with_content]
+            )
+            rels.extend(_siblings(sib_group))
             # parent: a folder index/readme is the parent of its folder-mates
             indexes = [d for d in group if _stem(d).lower() in _INDEX_STEMS]
             for idx in indexes:
@@ -76,6 +94,51 @@ class RelateStage:
 
         ctx.space.relations.extend(rels)
         return ctx
+
+
+def _docs_with_content(ctx: SpaceContext) -> set[str] | None:
+    """Doc ids carrying indexable content, or ``None`` when content is not yet known.
+
+    Returns ``None`` only when neither chunks nor parsed text are available — i.e. Relate was run
+    standalone right after Walk (no Parse/Chunk). Callers then skip the 0-chunk sibling filter and
+    keep the purely structural behavior. Otherwise:
+
+    * after Chunk (the build path), a doc "has content" iff it owns ≥1 chunk;
+    * before Chunk but after Parse (the relate-quality tests, and the reseal recompute that rebuilds
+      ``ctx.parsed`` from chunk text), iff its parsed text is non-empty.
+    """
+    if ctx.space.chunks:
+        return {c.doc_id for c in ctx.space.chunks}
+    if ctx.parsed:
+        return {doc_id for doc_id, p in ctx.parsed.items() if p is not None and p.text.strip()}
+    return None
+
+
+def _siblings(group: list[Document]) -> list[Relation]:
+    """Sibling edges within one (path-sorted) folder group, bounded above ``SIBLING_MAX``.
+
+    At or below the threshold, every unordered pair is linked (full symmetric pairing). Above it,
+    pairwise emission would be O(n^2), so each doc links only to its next :data:`SIBLING_NEIGHBORS`
+    path-adjacent siblings — deterministic, bounded at ~k*n, and (unlike the old hard cap) never
+    zero for a large folder (#14 N4).
+    """
+    out: list[Relation] = []
+    if len(group) <= SIBLING_MAX:
+        for i, a in enumerate(group):
+            for b in group[i + 1 :]:
+                out.append(Relation(src=a.id, dst=b.id, type=RelationType.SIBLING))
+    else:
+        _log.info(
+            "relate: folder with %d docs exceeds SIBLING_MAX=%d; emitting a bounded "
+            "%d-neighbour sibling graph instead of full pairwise edges",
+            len(group),
+            SIBLING_MAX,
+            SIBLING_NEIGHBORS,
+        )
+        for i, a in enumerate(group):
+            for b in group[i + 1 : i + 1 + SIBLING_NEIGHBORS]:
+                out.append(Relation(src=a.id, dst=b.id, type=RelationType.SIBLING))
+    return out
 
 
 def _stem(doc: Document) -> str:
@@ -108,6 +171,52 @@ def _doc_text(ctx: SpaceContext, doc: Document) -> str | None:
     return parsed.text if parsed is not None else None
 
 
+# Source extensions whose link structure lives in the *raw* file as plain text. For these we scan
+# the source on disk rather than the parser-normalized text: a normalizing parser (docling, the
+# default) discards link targets — ``[Beta](beta.md)`` becomes the bare word ``Beta`` — so mention
+# extraction from ``ctx.parsed`` finds nothing and ``references`` never fires (issue #17 bug 2).
+# Binary formats (docx/pdf/odt) carry no textual link syntax, so they keep using parsed text.
+_TEXTUAL_EXTS = frozenset(
+    {
+        ".md",
+        ".markdown",
+        ".mdx",
+        ".txt",
+        ".rst",
+        ".org",
+        ".html",
+        ".htm",
+        ".xhtml",
+        ".tex",
+        ".adoc",
+        ".asciidoc",
+        ".wiki",
+    }
+)
+
+
+def _mention_source_text(ctx: SpaceContext, doc: Document) -> str | None:
+    """Text to scan for outbound mentions, parser-independently.
+
+    Returns ``None`` for a document Parse never populated, so the "no parse ⇒ no content-derived
+    edges" contract of a standalone Relate is preserved. For a parsed textual document the raw file
+    on disk is read instead — link targets survive there regardless of which parser ran, whereas a
+    normalizing parser (docling, the default) drops them from the parsed text (issue #17 bug 2). If
+    the raw read fails (tree absent, I/O error) it falls back to the parser-normalized text; a
+    non-textual format always uses parsed text (it carries no textual link syntax).
+    """
+    parsed_text = _doc_text(ctx, doc)
+    if parsed_text is None:
+        return None
+    ext = ("." + doc.path.rsplit(".", 1)[-1].lower()) if "." in doc.path else ""
+    if ext in _TEXTUAL_EXTS:
+        try:
+            return (ctx.root / doc.path).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            pass
+    return parsed_text
+
+
 def _norm_path(path: str) -> str:
     """Forward-slash, lowercased, ``./`` and trailing-slash stripped — for matching mentions."""
     p = path.replace("\\", "/").strip()
@@ -136,7 +245,7 @@ def _references(ctx: SpaceContext) -> list[Relation]:
     out: list[Relation] = []
     seen: set[tuple[str, str]] = set()  # dedupe repeated mentions of the same target
     for src in docs:
-        text = _doc_text(ctx, src)
+        text = _mention_source_text(ctx, src)
         if not text:
             continue
         for token in _mention_tokens(text):
